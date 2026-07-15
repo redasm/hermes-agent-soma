@@ -298,6 +298,7 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             "chat_id": origin_chat_id,
             "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
             "thread_id": thread_id,
+            "session_id": get_session_env("HERMES_SESSION_ID") or None,
             # Captured so an opt-in delivery mirror (cron.mirror_delivery /
             # attach_to_session) can resolve the exact participant's session in
             # per-user-isolated group chats — parity with interactive
@@ -598,6 +599,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("response_mode"):
+        result["response_mode"] = job["response_mode"]
+    if job.get("context_provider"):
+        result["context_provider"] = job["context_provider"]
     return result
 
 
@@ -677,6 +682,9 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    response_mode: Optional[str] = None,
+    context_provider: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -750,6 +758,9 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                response_mode=response_mode,
+                context_provider=context_provider,
+                metadata=metadata,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -923,6 +934,12 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if response_mode is not None:
+                updates["response_mode"] = response_mode
+            if context_provider is not None:
+                updates["context_provider"] = context_provider
+            if metadata is not None:
+                updates["metadata"] = metadata
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -1085,6 +1102,20 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "boolean",
                 "description": "When True, this job becomes CONTINUABLE: the user can reply to its delivery and the agent has the brief in context instead of asking 'what is that?'. On thread-capable platforms (Telegram topics, Discord/Slack threads) a dedicated thread is opened for the job and its replies; on DM-only platforms (WhatsApp/Signal) the brief is mirrored into the origin DM session. Use this for conversational recurring jobs the user will reply to — daily briefings, reminders that kick off follow-up work. Leave unset for fire-and-forget alerts/watchdogs. Overrides the global cron.mirror_delivery config for this one job. Only the origin chat is touched (never fan-out targets); no effect when deliver='local'."
             },
+            "response_mode": {
+                "type": "string",
+                "enum": ["framed", "text_only"],
+                "description": "Optional per-job delivery presentation. 'framed' includes the cron name, job ID, and management footer. 'text_only' sends only the agent's final text, suitable for natural companion messages. Omit to inherit cron.wrap_response from config.yaml."
+            },
+            "context_provider": {
+                "type": "string",
+                "description": "Optional plugin provider ID for bounded, target-aware context on each scheduled turn. The provider receives the job identity and origin target, not the full live conversation; returned context is ephemeral and limited to this run. Omit for ordinary cron jobs."
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Optional host-side correlation data for this job (for example an attempt or outcome ID). It is persisted and returned only through the cron_delivery hook; it is never injected into the LLM prompt, delivery text, or normal job/list output. Maximum encoded size: 8192 bytes.",
+                "additionalProperties": True
+            },
         },
         "required": ["action"]
     }
@@ -1140,6 +1171,10 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        attach_to_session=args.get("attach_to_session"),
+        response_mode=args.get("response_mode"),
+        context_provider=args.get("context_provider"),
+        metadata=args.get("metadata"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

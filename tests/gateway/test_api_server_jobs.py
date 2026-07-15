@@ -170,6 +170,39 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
 
     @pytest.mark.asyncio
+    async def test_create_job_forwards_companion_host_contract_without_echoing_metadata(self, adapter):
+        app = _create_app(adapter)
+        stored_job = {
+            **SAMPLE_JOB,
+            "metadata": {"attempt_id": "attempt-42"},
+        }
+        mock_create = MagicMock(return_value=stored_job)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post(
+                    "/api/jobs",
+                    json={
+                        "name": "companion",
+                        "schedule": "every 1h",
+                        "prompt": "Companion tick",
+                        "attach_to_session": True,
+                        "response_mode": "text_only",
+                        "context_provider": "soma",
+                        "metadata": {"attempt_id": "attempt-42"},
+                    },
+                )
+
+                assert resp.status == 200
+                assert "metadata" not in (await resp.json())["job"]
+                kwargs = mock_create.call_args.kwargs
+                assert kwargs["attach_to_session"] is True
+                assert kwargs["response_mode"] == "text_only"
+                assert kwargs["context_provider"] == "soma"
+                assert kwargs["metadata"] == {"attempt_id": "attempt-42"}
+
+    @pytest.mark.asyncio
     async def test_create_job_missing_name(self, adapter):
         """POST /api/jobs without name returns 400."""
         app = _create_app(adapter)

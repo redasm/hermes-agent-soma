@@ -12,6 +12,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+from dataclasses import dataclass, field
 import json
 import logging
 import os
@@ -1402,7 +1403,70 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+@dataclass(frozen=True)
+class CronDeliveryReceipt:
+    """Host-owned result of delivering one scheduled job output."""
+
+    job_id: str
+    status: str
+    targets: tuple[dict, ...] = ()
+    metadata: dict = field(default_factory=dict)
+    error: Optional[str] = None
+
+    def as_dict(self) -> dict:
+        return {
+            "job_id": self.job_id,
+            "status": self.status,
+            "targets": [dict(target) for target in self.targets],
+            "metadata": dict(self.metadata),
+            "error": self.error,
+        }
+
+
+def _make_delivery_receipt(
+    job: dict,
+    status: str,
+    targets: Optional[list[dict]] = None,
+    error: Optional[str] = None,
+) -> CronDeliveryReceipt:
+    target_rows = tuple(
+        {
+            "platform": target.get("platform"),
+            "chat_id": str(target.get("chat_id")),
+            "thread_id": target.get("thread_id"),
+        }
+        for target in (targets or [])
+    )
+    metadata = job.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    runtime_metadata = job.get("_cron_runtime_metadata")
+    if isinstance(runtime_metadata, dict):
+        metadata = {**metadata, **runtime_metadata}
+    return CronDeliveryReceipt(
+        job_id=str(job.get("id") or ""),
+        status=status,
+        targets=target_rows,
+        metadata=dict(metadata),
+        error=error,
+    )
+
+
+def _notify_cron_delivery(receipt: CronDeliveryReceipt) -> None:
+    """Best-effort plugin notification after a host delivery attempt."""
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook("cron_delivery", receipt=receipt.as_dict())
+    except Exception as exc:
+        logger.warning(
+            "cron_delivery hook failed for job %r: %s", receipt.job_id, exc
+        )
+
+
+def _deliver_result_with_receipt(
+    job: dict, content: str, adapters=None, loop=None
+) -> CronDeliveryReceipt:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1411,13 +1475,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
 
-    Returns None on success, or an error string on failure.
+    Returns a host-owned receipt. Job metadata remains outside delivery text.
     """
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
-            return None  # local-only jobs don't deliver — not a failure
+            return _make_delivery_receipt(job, "skipped")
         # deliver=origin with no resolvable origin and no configured home
         # channels: treat as local rather than reporting an error.  CLI-created
         # jobs never capture a {platform, chat_id} origin, so failing here would
@@ -1430,17 +1494,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 "skipping delivery (output saved in last_output)",
                 job.get("name", job.get("id", "?")),
             )
-            return None
+            return _make_delivery_receipt(job, "skipped")
         msg = f"no delivery target resolved for deliver={deliver_value}"
         logger.warning("Job '%s': %s", job["id"], msg)
-        return msg
+        return _make_delivery_receipt(job, "failed", error=msg)
 
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
     # Optionally wrap the content with a header/footer so the user knows this
-    # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
+    # is a cron delivery. Per-job response_mode wins when explicitly set;
+    # otherwise preserve the global/default behaviour for existing jobs.
     wrap_response = True
     user_cfg = None
     try:
@@ -1448,6 +1512,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     except Exception:
         pass
+
+    response_mode = job.get("response_mode")
+    if response_mode == "text_only":
+        wrap_response = False
+    elif response_mode == "framed":
+        wrap_response = True
 
     if wrap_response:
         task_name = job.get("name", job["id"])
@@ -1485,7 +1555,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception as e:
         msg = f"failed to load gateway config: {e}"
         logger.error("Job '%s': %s", job["id"], msg)
-        return msg
+        return _make_delivery_receipt(job, "failed", targets, msg)
 
     delivery_errors = []
 
@@ -1969,8 +2039,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             )
 
     if delivery_errors:
-        return "; ".join(delivery_errors)
-    return None
+        return _make_delivery_receipt(
+            job, "failed", targets, "; ".join(delivery_errors)
+        )
+    return _make_delivery_receipt(job, "delivered", targets)
+
+
+def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+    """Backward-compatible error-only facade for existing scheduler callers."""
+    receipt = _deliver_result_with_receipt(
+        job, content, adapters=adapters, loop=loop
+    )
+    _notify_cron_delivery(receipt)
+    return receipt.error
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
@@ -2227,6 +2308,103 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+_MAX_CRON_PLUGIN_CONTEXT_CHARS = 8000
+_CRON_CONTEXT_TARGET_FIELDS = (
+    "platform",
+    "chat_id",
+    "thread_id",
+    "user_id",
+    "session_id",
+)
+
+
+def _load_cron_plugin_context(job: dict) -> str:
+    """Return bounded context from the provider explicitly selected by a job.
+
+    The hook receives only cron identity plus a whitelisted delivery target,
+    never conversation history. Results must name the same provider so hooks
+    registered for unrelated consumers cannot accidentally leak context.
+    """
+    job.pop("_cron_runtime_metadata", None)
+    provider = job.get("context_provider")
+    if not isinstance(provider, str) or not provider:
+        return ""
+
+    origin = _resolve_origin(job) or {}
+    target = {
+        key: origin.get(key)
+        for key in _CRON_CONTEXT_TARGET_FIELDS
+        if origin.get(key) not in (None, "")
+    }
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        results = invoke_hook(
+            "cron_context",
+            provider=provider,
+            job_id=str(job.get("id") or ""),
+            job_name=str(job.get("name") or ""),
+            schedule=job.get("schedule"),
+            target=target,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Cron context provider %r failed for job %r: %s",
+            provider,
+            job.get("id"),
+            exc,
+        )
+        return ""
+
+    parts = []
+    runtime_metadata = {}
+    for result in results:
+        if not isinstance(result, dict) or result.get("provider") != provider:
+            continue
+        context = result.get("context")
+        if isinstance(context, str) and context.strip():
+            parts.append(context.strip())
+        if result.get("metadata") is not None:
+            try:
+                from cron.jobs import _normalize_job_metadata
+
+                normalized = _normalize_job_metadata(result["metadata"])
+                if normalized:
+                    runtime_metadata.update(normalized)
+            except ValueError as exc:
+                logger.warning(
+                    "Cron context provider %r returned invalid metadata for "
+                    "job %r: %s",
+                    provider,
+                    job.get("id"),
+                    exc,
+                )
+
+    if runtime_metadata:
+        try:
+            from cron.jobs import _normalize_job_metadata
+
+            job["_cron_runtime_metadata"] = _normalize_job_metadata(
+                runtime_metadata
+            )
+        except ValueError as exc:
+            logger.warning(
+                "Cron context provider %r metadata exceeded the combined limit "
+                "for job %r: %s",
+                provider,
+                job.get("id"),
+                exc,
+            )
+
+    context = "\n\n".join(parts)
+    if len(context) > _MAX_CRON_PLUGIN_CONTEXT_CHARS:
+        context = (
+            context[:_MAX_CRON_PLUGIN_CONTEXT_CHARS]
+            + "\n\n[... context truncated ...]"
+        )
+    return context
+
+
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
@@ -2247,6 +2425,18 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     # pastes `rm -rf /`), so it must not be scanned with the strict
     # user-prompt pattern set — see _scan_assembled_cron_prompt.
     has_injected_data = False
+
+    provider_context = _load_cron_plugin_context(job)
+    if provider_context:
+        prompt = (
+            "## Scoped Context\n"
+            "The following plugin-provided context is scoped to this scheduled "
+            "turn and target. Use it as context; do not expose internal routing "
+            "details.\n\n"
+            f"```\n{provider_context}\n```\n\n"
+            f"{prompt}"
+        )
+        has_injected_data = True
 
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
@@ -3533,6 +3723,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    receipt_emitted = False
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3635,9 +3826,19 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             if should_deliver:
                 try:
                     delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    receipt_emitted = True
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
+                    _notify_cron_delivery(
+                        _make_delivery_receipt(
+                            job, "failed", error=delivery_error
+                        )
+                    )
+                    receipt_emitted = True
+            else:
+                _notify_cron_delivery(_make_delivery_receipt(job, "skipped"))
+                receipt_emitted = True
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
             # (or raised). Must happen on every path so cron agents never leak
@@ -3658,6 +3859,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
+        if not receipt_emitted:
+            _notify_cron_delivery(
+                _make_delivery_receipt(job, "failed", error=str(e))
+            )
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
         return False
