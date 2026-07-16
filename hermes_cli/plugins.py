@@ -383,6 +383,26 @@ class PluginContext:
             },
         }
 
+    def get_host_observations(self) -> Dict[str, Any]:
+        """Return minimum, non-secret device context available to plugins."""
+        from hermes_time import get_timezone_context
+
+        capabilities = self.get_host_capabilities()
+        return {
+            "profile": self.profile_name,
+            "timezone": get_timezone_context(),
+            "location": {
+                "status": "unavailable",
+                "permission": "unavailable",
+                "source": "none",
+            },
+            "browser": {
+                "available": capabilities["tools"]["browser"],
+                "authorization": "unknown",
+                "source": "host_browser",
+            },
+        }
+
     # -- host-owned LLM access ----------------------------------------------
 
     @property

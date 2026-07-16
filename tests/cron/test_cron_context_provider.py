@@ -60,6 +60,7 @@ def test_build_prompt_injects_matching_provider_context_ephemerally(monkeypatch)
     assert calls[0][0] == "cron_context"
     assert calls[0][1]["provider"] == "soma"
     assert calls[0][1]["target"] == {
+        "profile": "default",
         "platform": "telegram",
         "chat_id": "chat-42",
         "thread_id": "topic-7",

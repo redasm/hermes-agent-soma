@@ -2310,6 +2310,7 @@ def _parse_wake_gate(script_output: str) -> bool:
 
 _MAX_CRON_PLUGIN_CONTEXT_CHARS = 8000
 _CRON_CONTEXT_TARGET_FIELDS = (
+    "profile",
     "platform",
     "chat_id",
     "thread_id",
@@ -2336,6 +2337,13 @@ def _load_cron_plugin_context(job: dict) -> str:
         for key in _CRON_CONTEXT_TARGET_FIELDS
         if origin.get(key) not in (None, "")
     }
+    if "profile" not in target:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            target["profile"] = get_active_profile_name()
+        except Exception:
+            target["profile"] = "default"
     try:
         from hermes_cli.plugins import invoke_hook
 

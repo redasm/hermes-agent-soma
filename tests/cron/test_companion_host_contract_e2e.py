@@ -92,3 +92,31 @@ def test_plugin_context_reports_versioned_runtime_capabilities():
     assert capabilities["tools"]["names"] == sorted(capabilities["tools"]["names"])
     assert isinstance(capabilities["tools"]["web_search"], bool)
     assert isinstance(capabilities["tools"]["browser"], bool)
+
+
+def test_plugin_context_reports_timezone_without_inventing_location_or_login(
+    tmp_path, monkeypatch
+):
+    import hermes_time
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_TIMEZONE", "Asia/Shanghai")
+    hermes_time.reset_cache()
+    context = PluginContext(
+        PluginManifest(name="observation-consumer", key="observation-consumer"),
+        PluginManager(),
+    )
+
+    observations = context.get_host_observations()
+
+    assert observations["timezone"] == {
+        "status": "available",
+        "name": "Asia/Shanghai",
+        "source": "configured",
+    }
+    assert observations["location"]["status"] == "unavailable"
+    assert observations["location"]["permission"] == "unavailable"
+    assert observations["browser"]["authorization"] == "unknown"
+    assert "cookie" not in str(observations).lower()
+    assert "token" not in str(observations).lower()

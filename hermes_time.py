@@ -106,6 +106,24 @@ def get_timezone() -> Optional[ZoneInfo]:
     return _cached_tz
 
 
+def get_timezone_context() -> dict:
+    """Return the effective timezone name and whether it was configured."""
+    configured = _resolve_timezone_name()
+    zone = get_timezone()
+    if zone is not None:
+        return {
+            "status": "available",
+            "name": getattr(zone, "key", None) or configured or str(zone),
+            "source": "configured" if configured else "system",
+        }
+    local_zone = datetime.now().astimezone().tzinfo
+    return {
+        "status": "available",
+        "name": getattr(local_zone, "key", None) or str(local_zone or "UTC"),
+        "source": "system",
+    }
+
+
 def reset_cache() -> None:
     """Clear the cached timezone so the next call re-resolves it.
 
