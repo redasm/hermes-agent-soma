@@ -19,6 +19,12 @@ That batch adds four optional, backward-compatible cron fields
 receipts. This is the right kind of fork change: it is a general scheduling and
 delivery contract with no Soma domain imports.
 
+The following generic host batches are now also implemented:
+
+- versioned plugin capability discovery and a plugin → scheduler → delivery receipt E2E test;
+- scoped profile, timezone, and browser-authorization observations;
+- Windows OS-mediated location with explicit `granted | denied | unavailable` status and no IP fallback.
+
 Focused verification on 2026-07-16:
 
 ```text
@@ -92,7 +98,7 @@ distribution concerns.
 The order below is dependency-driven. Companion-domain work is intentionally
 absent.
 
-### H1 — Harden the existing cron contract
+### H1 — Harden the existing cron contract (implemented)
 
 - Preserve `response_mode`, provider, origin identity and private metadata through all create/update/list/dashboard/gateway paths.
 - Prove metadata and captured session identity never appear in generated text or public job responses.
@@ -102,7 +108,7 @@ absent.
 Exit gate: the end-to-end receipt identifies one execution and one delivery
 target without exposing correlation IDs to the user.
 
-### H2 — Stable plugin runtime capabilities
+### H2 — Stable plugin runtime capabilities (implemented foundation)
 
 - Add a structured capability query for scheduler, delivery, search, browser, image and location services.
 - Return typed/structured dispatch errors instead of requiring plugins to parse strings.
@@ -111,7 +117,7 @@ target without exposing correlation IDs to the user.
 Exit gate: a plugin can select a supported path without guessing tool names or
 matching English error text.
 
-### H3 — Authorized real-world observations
+### H3 — Authorized real-world observations (timezone/location implemented)
 
 - Expose the configured system timezone as structured host context.
 - Add an explicit-permission location observation contract; desktop OS location and platform-shared location are providers, not silent IP geolocation.
@@ -120,7 +126,7 @@ matching English error text.
 Exit gate: plugins receive only the minimum observation needed, can distinguish
 unavailable from denied, and cannot access credentials.
 
-### H4 — Search/browser provider surface
+### H4 — Search/browser provider surface (capability discovery implemented)
 
 - Keep `web_search` as the public-web primitive.
 - Provide a generic way for installed MCP/provider tools to advertise normalized search capabilities.

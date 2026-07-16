@@ -39,7 +39,6 @@ cronjob(
     response_mode="text_only",
     attach_to_session=True,
     context_provider="soma",
-    metadata={"outcome_id": "internal-outcome-id"},
 )
 ```
 
@@ -91,6 +90,20 @@ The optional returned `metadata` is run-scoped. It is merged into the delivery
 receipt but is not persisted to `jobs.json` and never becomes prompt text. This
 lets Soma create a fresh `attempt_id` on each tick without asking the LLM to
 repeat it.
+
+## Capability and observation discovery
+
+Plugins can call `ctx.get_host_capabilities()` instead of probing tool names.
+The versioned response reports scheduled context, receipts, text-only delivery,
+session continuity, search, browser, image, and observation surfaces.
+`ctx.get_host_observations()` returns minimum non-secret profile, timezone, and
+browser state; `ctx.get_location_observation()` performs one OS-mediated
+location observation.
+
+Location status is `granted`, `denied`, or `unavailable`. The Windows provider
+uses the OS Location API and never falls back to IP geolocation. Browser
+authorization remains `unknown` unless a provider can prove an authorized
+session; browser availability alone is not evidence of login.
 
 ## `cron_delivery` hook
 
