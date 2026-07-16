@@ -143,6 +143,12 @@ VALID_HOOKS: Set[str] = {
     "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
+    # Scheduled-turn context provider. A cron job explicitly names a provider;
+    # matching plugins may return bounded context for that one turn only.
+    "cron_context",
+    # Structured host delivery outcome for scheduled jobs. Internal job
+    # metadata stays outside model-visible text and is returned here.
+    "cron_delivery",
     # Verification-loop gate. Fired once per turn when the agent has edited code
     # and is about to verify/finish (after the verify-on-stop guard). A callback
     # may keep the agent going — run a check, defer it, tidy the diff — instead

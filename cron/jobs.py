@@ -38,6 +38,8 @@ from typing import Optional, Dict, List, Any, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
+_MAX_JOB_METADATA_BYTES = 8192
+
 from hermes_time import now as _hermes_now
 from utils import atomic_replace
 
@@ -1036,6 +1038,42 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+def _validate_context_provider(value: Any) -> Optional[str]:
+    """Validate and normalize a plugin context-provider identifier."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", value
+    ):
+        raise ValueError(
+            "context_provider must be a 1-64 character plugin identifier "
+            "using letters, numbers, '.', '_' or '-'"
+        )
+    return value
+
+
+def _normalize_job_metadata(value: Any) -> Optional[Dict[str, Any]]:
+    """Return an isolated JSON-safe metadata object for host-side correlation."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise ValueError("metadata must be a JSON object with string keys")
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("metadata must contain only JSON-serializable values") from exc
+    if len(encoded) > _MAX_JOB_METADATA_BYTES:
+        raise ValueError(
+            f"metadata must be no larger than {_MAX_JOB_METADATA_BYTES} UTF-8 bytes"
+        )
+    return json.loads(encoded.decode("utf-8"))
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1054,6 +1092,9 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    response_mode: Optional[str] = None,
+    context_provider: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1130,6 +1171,10 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    if response_mode is not None and response_mode not in {"framed", "text_only"}:
+        raise ValueError("response_mode must be 'framed' or 'text_only'")
+    normalized_context_provider = _validate_context_provider(context_provider)
+    normalized_metadata = _normalize_job_metadata(metadata)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1225,6 +1270,12 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if response_mode is not None:
+        job["response_mode"] = response_mode
+    if normalized_context_provider is not None:
+        job["context_provider"] = normalized_context_provider
+    if normalized_metadata is not None:
+        job["metadata"] = normalized_metadata
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1299,6 +1350,18 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         raise ValueError(
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
+
+    if "response_mode" in updates and updates["response_mode"] not in {
+        "framed",
+        "text_only",
+    }:
+        raise ValueError("response_mode must be 'framed' or 'text_only'")
+    if "context_provider" in updates:
+        updates["context_provider"] = _validate_context_provider(
+            updates["context_provider"]
+        )
+    if "metadata" in updates:
+        updates["metadata"] = _normalize_job_metadata(updates["metadata"])
 
     with _jobs_lock():
         jobs = load_jobs()
