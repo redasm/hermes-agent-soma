@@ -965,6 +965,46 @@ class TestVoiceChannelCommands:
         assert event.source.chat_type == "channel"
 
     @pytest.mark.asyncio
+    async def test_input_scopes_pending_first_response_to_message_dispatch(self, runner):
+        from gateway.config import Platform
+
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_adapter._voice_response_pending = {}
+        mock_adapter._voice_active_turn_ids = {}
+        mock_adapter._voice_active_action_ids = {}
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=None)
+
+        async def _handle_message(_event):
+            subject_id, started_at, turn_id, action_id = mock_adapter._voice_response_pending[111]
+            assert subject_id == "42"
+            assert started_at == 10.0
+            assert turn_id.startswith("voice-turn:discord:111:123:")
+            assert action_id.startswith("voice-output:discord:111:123:")
+            assert turn_id.rsplit(":", 1)[-1] == action_id.rsplit(":", 1)[-1]
+            assert mock_adapter._voice_active_turn_ids[111] == turn_id
+            assert mock_adapter._voice_active_action_ids[111] == action_id
+
+        mock_adapter.handle_message.side_effect = _handle_message
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        emitted = []
+        with patch("gateway.run.time.monotonic", return_value=10.0), \
+             patch(
+                 "gateway.voice_lifecycle.emit_voice_transcript",
+                 side_effect=lambda session_id, **payload: emitted.append((session_id, payload)),
+             ):
+            await runner._handle_voice_channel_input(111, 42, "Hello from VC")
+
+        assert mock_adapter._voice_response_pending == {}
+        assert mock_adapter._voice_active_turn_ids == {}
+        assert mock_adapter._voice_active_action_ids == {}
+        assert emitted[0][1]["turn_id"].startswith("voice-turn:discord:111:123:")
+        assert emitted[0][1]["action_id"].startswith("voice-output:discord:111:123:")
+
+    @pytest.mark.asyncio
     async def test_input_reuses_bound_source_metadata(self, runner):
         """Voice input should share the linked text channel session metadata."""
         from gateway.config import Platform
@@ -1138,6 +1178,10 @@ class TestDiscordVoiceChannelMethods:
         adapter._voice_clients[111] = mock_vc
         adapter._voice_text_channels[111] = 123
         adapter._voice_sources[111] = {"chat_id": "123", "chat_type": "group"}
+        adapter._voice_response_pending = {111: ("42", 10.0, "turn-1", "action-1")}
+        adapter._voice_active_turn_ids = {111: "turn-1"}
+        adapter._voice_active_action_ids = {111: "action-1"}
+        adapter._voice_delivered_action_ids = {111: {"action-1"}}
 
         mock_receiver = MagicMock()
         adapter._voice_receivers[111] = mock_receiver
@@ -1158,6 +1202,10 @@ class TestDiscordVoiceChannelMethods:
         assert 111 not in adapter._voice_text_channels
         assert 111 not in adapter._voice_sources
         assert 111 not in adapter._voice_receivers
+        assert 111 not in adapter._voice_response_pending
+        assert 111 not in adapter._voice_active_turn_ids
+        assert 111 not in adapter._voice_active_action_ids
+        assert 111 not in adapter._voice_delivered_action_ids
 
     @pytest.mark.asyncio
     async def test_leave_voice_channel_no_connection(self):
@@ -1954,6 +2002,28 @@ class TestVoiceTimeoutCleansRunnerState:
             "_on_voice_disconnect must be called with chat_id on timeout"
 
     @pytest.mark.asyncio
+    async def test_timeout_callback_preserves_voice_session_identity(self, adapter):
+        """Timeout cleanup receives the guild and original authorized source."""
+        callback_calls = []
+
+        def on_disconnect(chat_id, *, guild_id, source):
+            callback_calls.append((chat_id, guild_id, source))
+
+        adapter._on_voice_disconnect = on_disconnect
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+        mock_vc.disconnect = AsyncMock()
+        adapter._voice_clients[111] = mock_vc
+        adapter._voice_text_channels[111] = 999
+        adapter._voice_sources[111] = {"user_id": "user-7"}
+        adapter._voice_timeout_tasks[111] = MagicMock()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await adapter._voice_timeout_handler(111)
+
+        assert callback_calls == [("999", 111, {"user_id": "user-7"})]
+
+    @pytest.mark.asyncio
     async def test_runner_cleanup_method_removes_voice_mode(self, tmp_path):
         """_handle_voice_timeout_cleanup removes voice_mode for chat."""
         runner = _make_runner(tmp_path)
@@ -1963,6 +2033,74 @@ class TestVoiceTimeoutCleansRunnerState:
 
         assert runner._voice_mode["discord:999"] == "off", \
             "voice_mode must persist explicit off state after timeout cleanup"
+
+    @pytest.mark.asyncio
+    async def test_runner_timeout_ends_original_voice_session(self, tmp_path, monkeypatch):
+        """Timeout end uses the same session and subject as the join event."""
+        from gateway import voice_lifecycle
+
+        emitted = []
+        monkeypatch.setattr(
+            voice_lifecycle,
+            "emit_voice_session_end",
+            lambda session_id, **payload: emitted.append((session_id, payload)),
+        )
+        runner = _make_runner(tmp_path)
+
+        runner._handle_voice_timeout_cleanup(
+            "999",
+            guild_id=111,
+            source={"user_id": "user-7"},
+        )
+
+        assert emitted == [
+            (
+                "discord:111:999",
+                {"subject_id": "user-7", "origin": "discord_voice_channel"},
+            )
+        ]
+
+    def test_speech_start_emits_detected_to_stopped_latency(self, tmp_path, monkeypatch):
+        from gateway import voice_lifecycle
+        from gateway.config import Platform
+
+        runner = _make_runner(tmp_path)
+        adapter = MagicMock()
+        adapter.interrupt_voice_playback.return_value = True
+        adapter._voice_text_channels = {111: 999}
+        adapter._voice_active_turn_ids = {111: "voice-turn:discord:111:999:answer-1"}
+        adapter._voice_active_action_ids = {
+            111: "voice-output:discord:111:999:answer-1"
+        }
+        runner.adapters[Platform.DISCORD] = adapter
+        emitted = []
+        monkeypatch.setattr("gateway.run.time.monotonic", lambda: 10.125)
+        monkeypatch.setattr(
+            voice_lifecycle,
+            "emit_voice_barge_in",
+            lambda session_id, **payload: emitted.append((session_id, payload)),
+        )
+
+        runner._handle_voice_speech_start(
+            111,
+            42,
+            detected_at_monotonic=10.0,
+        )
+
+        assert emitted == [
+            (
+                "discord:111:999",
+                {
+                    "subject_id": "42",
+                    "turn_id": "voice-turn:discord:111:999:answer-1",
+                    "action_id": "voice-output:discord:111:999:answer-1",
+                    "origin": "discord_voice_channel",
+                    "latency_ms": 125.0,
+                },
+            )
+        ]
+        assert adapter._voice_active_turn_ids == {}
+        assert adapter._voice_active_action_ids == {}
 
     @pytest.mark.asyncio
     async def test_timeout_without_callback_does_not_crash(self, adapter):
@@ -2125,6 +2263,87 @@ class TestPlaybackTimeout:
             mock_vc.stop.assert_called()
         finally:
             DiscordAdapter.PLAYBACK_TIMEOUT = original_timeout
+
+    @pytest.mark.asyncio
+    async def test_playback_start_emits_pending_first_response_latency(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = self._make_discord_adapter()
+        adapter._voice_response_pending = {
+            111: (
+                "42",
+                10.0,
+                "voice-turn:discord:111:123:answer-1",
+                "voice-output:discord:111:123:answer-1",
+            )
+        }
+        adapter._voice_active_turn_ids = {
+            111: "voice-turn:discord:111:123:answer-1"
+        }
+        adapter._voice_active_action_ids = {
+            111: "voice-output:discord:111:123:answer-1"
+        }
+        adapter._voice_text_channels[111] = 123
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+        mock_vc.is_playing.return_value = False
+
+        def _play(_source, after):
+            after(None)
+
+        mock_vc.play.side_effect = _play
+        adapter._voice_clients[111] = mock_vc
+
+        with patch("discord.FFmpegPCMAudio"), \
+             patch("discord.PCMVolumeTransformer", side_effect=lambda source, **_kw: source), \
+             patch("plugins.platforms.discord.adapter.time.monotonic", return_value=10.85), \
+             patch("gateway.voice_lifecycle.emit_voice_response_start") as emit_start, \
+             patch("gateway.voice_lifecycle.emit_voice_delivery") as emit_delivery, \
+             patch.object(adapter, "_reset_voice_timeout"):
+            result = await adapter.play_in_voice_channel(111, "/tmp/test.mp3")
+
+        assert result is True
+        emit_start.assert_called_once_with(
+            "discord:111:123",
+            subject_id="42",
+            turn_id="voice-turn:discord:111:123:answer-1",
+            action_id="voice-output:discord:111:123:answer-1",
+            origin="discord_voice_channel",
+            latency_ms=pytest.approx(850.0),
+        )
+        emit_delivery.assert_called_once_with(
+            "discord:111:123",
+            subject_id="42",
+            turn_id="voice-turn:discord:111:123:answer-1",
+            action_id="voice-output:discord:111:123:answer-1",
+            origin="discord_voice_channel",
+            delivered=True,
+        )
+        assert adapter._voice_response_pending == {}
+
+    @pytest.mark.asyncio
+    async def test_playback_error_does_not_emit_a_successful_delivery_receipt(self):
+        adapter = self._make_discord_adapter()
+        action_id = "voice-output:discord:111:123:answer-1"
+        turn_id = "voice-turn:discord:111:123:answer-1"
+        adapter._voice_response_pending = {111: ("42", 10.0, turn_id, action_id)}
+        adapter._voice_active_turn_ids = {111: turn_id}
+        adapter._voice_active_action_ids = {111: action_id}
+        adapter._voice_text_channels[111] = 123
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+        mock_vc.is_playing.return_value = False
+        mock_vc.play.side_effect = lambda _source, after: after(RuntimeError("device failed"))
+        adapter._voice_clients[111] = mock_vc
+
+        with patch("discord.FFmpegPCMAudio"), \
+             patch("discord.PCMVolumeTransformer", side_effect=lambda source, **_kw: source), \
+             patch("gateway.voice_lifecycle.emit_voice_response_start"), \
+             patch("gateway.voice_lifecycle.emit_voice_delivery") as emit_delivery, \
+             patch.object(adapter, "_reset_voice_timeout"):
+            assert await adapter.play_in_voice_channel(111, "/tmp/test.mp3") is True
+
+        assert emit_delivery.call_args.kwargs["delivered"] is False
 
 
 # =====================================================================

@@ -367,9 +367,15 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
-    def __init__(self, voice_client, allowed_user_ids: set = None):
+    def __init__(
+        self,
+        voice_client,
+        allowed_user_ids: set = None,
+        on_speech_start: Optional[Callable[[int, float], None]] = None,
+    ):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
+        self._on_speech_start = on_speech_start
         self._running = False
 
         # Decryption
@@ -384,6 +390,7 @@ class VoiceReceiver:
         # Per-user audio buffers
         self._buffers: Dict[int, bytearray] = defaultdict(bytearray)
         self._last_packet_time: Dict[int, float] = {}
+        self._speech_started_ssrc: set[int] = set()
 
         # Opus decoder per SSRC (each user needs own decoder state)
         self._decoders: Dict[int, object] = {}
@@ -603,8 +610,20 @@ class VoiceReceiver:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
             with self._lock:
+                first_packet = ssrc not in self._speech_started_ssrc
                 self._buffers[ssrc].extend(pcm)
                 self._last_packet_time[ssrc] = time.monotonic()
+                if first_packet:
+                    self._speech_started_ssrc.add(ssrc)
+                    user_id = self._ssrc_to_user.get(ssrc, 0)
+                    if user_id and self._on_speech_start:
+                        try:
+                            self._on_speech_start(
+                                user_id,
+                                self._last_packet_time[ssrc],
+                            )
+                        except Exception:
+                            logger.debug("voice speech-start callback failed", exc_info=True)
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
@@ -671,10 +690,12 @@ class VoiceReceiver:
                         completed.append((user_id, bytes(buf)))
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
+                    self._speech_started_ssrc.discard(ssrc)
                 elif silence_duration >= self.SILENCE_THRESHOLD * 2:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
+                    self._speech_started_ssrc.discard(ssrc)
 
         return completed
 
@@ -837,6 +858,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
+        self._voice_speech_start_callback: Optional[Callable] = None  # set by run.py
+        self._voice_response_pending: Dict[int, tuple[str, float, str, str]] = {}
+        self._voice_active_turn_ids: Dict[int, str] = {}
+        self._voice_active_action_ids: Dict[int, str] = {}
+        self._voice_delivered_action_ids: Dict[int, set[str]] = {}
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
         # Resolves the current voice-reply mode ("off"|"voice_only"|"all") for a
         # linked text-channel id; set by run.py. Lets the inactivity timer leave
@@ -2872,7 +2898,19 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Start voice receiver (Phase 2: listen to users)
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                receiver = VoiceReceiver(
+                    vc,
+                    allowed_user_ids=self._allowed_user_ids,
+                    on_speech_start=(
+                        lambda user_id, detected_at: self._voice_speech_start_callback(
+                            guild_id,
+                            user_id,
+                            detected_at_monotonic=detected_at,
+                        )
+                        if self._voice_speech_start_callback
+                        else None
+                    ),
+                )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -2920,9 +2958,88 @@ class DiscordAdapter(BasePlatformAdapter):
                 task.cancel()
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
+            getattr(self, "_voice_response_pending", {}).pop(guild_id, None)
+            getattr(self, "_voice_active_turn_ids", {}).pop(guild_id, None)
+            getattr(self, "_voice_active_action_ids", {}).pop(guild_id, None)
+            getattr(self, "_voice_delivered_action_ids", {}).pop(guild_id, None)
 
     # Maximum seconds to wait for voice playback before giving up
     PLAYBACK_TIMEOUT = 120
+
+    def interrupt_voice_playback(self, guild_id: int) -> bool:
+        """Stop current spoken output immediately for user barge-in."""
+        interrupted = False
+        mixer = getattr(self, "_voice_mixers", {}).get(guild_id)
+        if mixer is not None and getattr(mixer, "speech_active", False):
+            mixer.stop_speech()
+            interrupted = True
+        else:
+            voice_client = getattr(self, "_voice_clients", {}).get(guild_id)
+            if voice_client is not None and voice_client.is_playing():
+                voice_client.stop()
+                interrupted = True
+        receiver = getattr(self, "_voice_receivers", {}).get(guild_id)
+        if receiver is not None:
+            receiver.resume()
+        return interrupted
+
+    def _emit_pending_voice_response_start(
+        self, guild_id: int
+    ) -> Optional[tuple[str, str, str]]:
+        pending = getattr(self, "_voice_response_pending", {}).pop(guild_id, None)
+        text_channel_id = self._voice_text_channels.get(guild_id)
+        if pending is None or text_channel_id is None:
+            return None
+        subject_id, final_at, turn_id, action_id = pending
+        latency_ms = max(0.0, (time.monotonic() - final_at) * 1000)
+        try:
+            from gateway.voice_lifecycle import emit_voice_response_start
+
+            emit_voice_response_start(
+                f"discord:{guild_id}:{text_channel_id}",
+                subject_id=subject_id,
+                turn_id=turn_id,
+                action_id=action_id,
+                origin="discord_voice_channel",
+                latency_ms=latency_ms,
+            )
+        except Exception:
+            logger.debug("voice response start hook failed", exc_info=True)
+        return subject_id, turn_id, action_id
+
+    def _emit_voice_delivery(
+        self,
+        guild_id: int,
+        identity: Optional[tuple[str, str, str]],
+        *,
+        delivered: bool,
+    ) -> None:
+        text_channel_id = self._voice_text_channels.get(guild_id)
+        if identity is None or text_channel_id is None:
+            return
+        subject_id, turn_id, action_id = identity
+        active_turn = getattr(self, "_voice_active_turn_ids", {}).get(guild_id)
+        active_action = getattr(self, "_voice_active_action_ids", {}).get(guild_id)
+        delivered = delivered and active_turn == turn_id and active_action == action_id
+        if delivered:
+            delivered_actions = getattr(self, "_voice_delivered_action_ids", None)
+            if delivered_actions is None:
+                delivered_actions = {}
+                self._voice_delivered_action_ids = delivered_actions
+            delivered_actions.setdefault(guild_id, set()).add(action_id)
+        try:
+            from gateway.voice_lifecycle import emit_voice_delivery
+
+            emit_voice_delivery(
+                f"discord:{guild_id}:{text_channel_id}",
+                subject_id=subject_id,
+                turn_id=turn_id,
+                action_id=action_id,
+                origin="discord_voice_channel",
+                delivered=delivered,
+            )
+        except Exception:
+            logger.debug("voice delivery hook failed", exc_info=True)
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play an audio file in the connected voice channel.
@@ -2936,6 +3053,14 @@ class DiscordAdapter(BasePlatformAdapter):
         if not vc or not vc.is_connected():
             return False
 
+        pending = getattr(self, "_voice_response_pending", {}).get(guild_id)
+        delivered_actions = getattr(self, "_voice_delivered_action_ids", {})
+        if pending is not None and pending[3] in delivered_actions.get(guild_id, set()):
+            identity = (pending[0], pending[2], pending[3])
+            self._voice_response_pending.pop(guild_id, None)
+            self._emit_voice_delivery(guild_id, identity, delivered=False)
+            return True
+
         # ── Mixer path (overlap + ducking) ──────────────────────────────
         mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
         if mixer is not None:
@@ -2947,17 +3072,21 @@ class DiscordAdapter(BasePlatformAdapter):
             if pcm:
                 speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
                 mixer.play_speech(pcm, gain=speech_gain)
+                identity = self._emit_pending_voice_response_start(guild_id)
                 # Block until the speech child drains so callers serialise
                 # replies (mirrors legacy semantics) but the ambient keeps
                 # playing underneath the whole time.
                 wait_start = time.monotonic()
+                playback_succeeded = True
                 while mixer.speech_active:
                     if time.monotonic() - wait_start > self.PLAYBACK_TIMEOUT:
+                        playback_succeeded = False
                         logger.warning("Mixer speech playback timed out after %ds", self.PLAYBACK_TIMEOUT)
                         mixer.stop_speech()
                         break
                     await asyncio.sleep(0.05)
                 self._reset_voice_timeout(guild_id)
+                self._emit_voice_delivery(guild_id, identity, delivered=playback_succeeded)
                 return True
             logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
 
@@ -2979,21 +3108,27 @@ class DiscordAdapter(BasePlatformAdapter):
 
             done = asyncio.Event()
             loop = asyncio.get_running_loop()
+            playback_succeeded = True
 
             def _after(error):
+                nonlocal playback_succeeded
                 if error:
+                    playback_succeeded = False
                     logger.error("Voice playback error: %s", error)
                 loop.call_soon_threadsafe(done.set)
 
             source = discord.FFmpegPCMAudio(audio_path)
             source = discord.PCMVolumeTransformer(source, volume=1.0)
             vc.play(source, after=_after)
+            identity = self._emit_pending_voice_response_start(guild_id)
             try:
                 await asyncio.wait_for(done.wait(), timeout=self.PLAYBACK_TIMEOUT)
             except asyncio.TimeoutError:
+                playback_succeeded = False
                 logger.warning("Voice playback timed out after %ds", self.PLAYBACK_TIMEOUT)
                 vc.stop()
             self._reset_voice_timeout(guild_id)
+            self._emit_voice_delivery(guild_id, identity, delivered=playback_succeeded)
             return True
         finally:
             if receiver:
@@ -3027,6 +3162,7 @@ class DiscordAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             return
         text_ch_id = self._voice_text_channels.get(guild_id)
+        voice_source = self._voice_sources.get(guild_id)
         # ``/voice off`` mutes spoken replies but deliberately keeps the bot in
         # the channel (leaving is ``/voice leave``). The inactivity timer only
         # counts the bot's OWN audio as activity, so under voice-off mode it
@@ -3045,7 +3181,23 @@ class DiscordAdapter(BasePlatformAdapter):
         # Notify the runner so it can clean up voice_mode state
         if self._on_voice_disconnect and text_ch_id:
             try:
-                self._on_voice_disconnect(str(text_ch_id))
+                inspect.signature(self._on_voice_disconnect).bind(
+                    str(text_ch_id), guild_id=guild_id, source=voice_source
+                )
+                accepts_identity = True
+            except (TypeError, ValueError):
+                accepts_identity = False
+            try:
+                if accepts_identity:
+                    self._on_voice_disconnect(
+                        str(text_ch_id),
+                        guild_id=guild_id,
+                        source=voice_source,
+                    )
+                else:
+                    # Preserve compatibility with integrations using the
+                    # original one-argument internal callback.
+                    self._on_voice_disconnect(str(text_ch_id))
             except Exception:
                 pass
         if text_ch_id and self._client:

@@ -9,6 +9,7 @@ integration (install on join, play routing, ack) is tested with the standard
 
 import os
 import sys
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -196,13 +197,44 @@ class TestPlayInVoiceChannelMixerPath:
 
         mixer = _Mixer()
         adapter._voice_mixers[111] = mixer
+        adapter._voice_response_pending = {
+            111: (
+                "42",
+                time.monotonic() - 0.85,
+                "voice-turn:discord:111:123:answer-1",
+                "voice-output:discord:111:123:answer-1",
+            )
+        }
+        adapter._voice_active_action_ids = {
+            111: "voice-output:discord:111:123:answer-1"
+        }
+        adapter._voice_active_turn_ids = {111: "voice-turn:discord:111:123:answer-1"}
+        adapter._voice_text_channels[111] = 123
         adapter._reset_voice_timeout = MagicMock()
 
         fake_pcm = b"\x00" * vm.FRAME_SIZE
-        with patch.object(vm, "decode_to_pcm", return_value=fake_pcm):
+        with patch.object(vm, "decode_to_pcm", return_value=fake_pcm), \
+                patch("gateway.voice_lifecycle.emit_voice_response_start") as emit_start, \
+                patch("gateway.voice_lifecycle.emit_voice_delivery") as emit_delivery:
             ok = await adapter.play_in_voice_channel(111, "/tmp/x.mp3")
         assert ok is True
         mixer.play_speech.assert_called_once()
+        emit_start.assert_called_once()
+        args, kwargs = emit_start.call_args
+        assert args == ("discord:111:123",)
+        assert kwargs["subject_id"] == "42"
+        assert kwargs["turn_id"] == "voice-turn:discord:111:123:answer-1"
+        assert kwargs["action_id"] == "voice-output:discord:111:123:answer-1"
+        assert kwargs["origin"] == "discord_voice_channel"
+        assert kwargs["latency_ms"] == pytest.approx(850.0, abs=100.0)
+        emit_delivery.assert_called_once_with(
+            "discord:111:123",
+            subject_id="42",
+            turn_id="voice-turn:discord:111:123:answer-1",
+            action_id="voice-output:discord:111:123:answer-1",
+            origin="discord_voice_channel",
+            delivered=True,
+        )
         # Legacy path must NOT have been used.
         vc.play.assert_not_called()
 
@@ -232,6 +264,86 @@ class TestPlayInVoiceChannelMixerPath:
                 ok = await adapter.play_in_voice_channel(111, "/tmp/x.mp3")
         # Fell through to legacy path -> vc.play called.
         assert vc.play.called
+
+    @pytest.mark.asyncio
+    async def test_suppresses_retry_of_an_already_delivered_action(self):
+        adapter = _make_adapter()
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        adapter._voice_clients[111] = vc
+        mixer = MagicMock()
+        mixer.speech_active = False
+        adapter._voice_mixers[111] = mixer
+        adapter._voice_text_channels[111] = 123
+        adapter._reset_voice_timeout = MagicMock()
+        action_id = "voice-output:discord:111:123:answer-1"
+        turn_id = "voice-turn:discord:111:123:answer-1"
+        adapter._voice_active_turn_ids = {111: turn_id}
+        adapter._voice_active_action_ids = {111: action_id}
+
+        fake_pcm = b"\x00" * vm.FRAME_SIZE
+        with patch.object(vm, "decode_to_pcm", return_value=fake_pcm), \
+                patch("gateway.voice_lifecycle.emit_voice_response_start"), \
+                patch("gateway.voice_lifecycle.emit_voice_delivery") as emit_delivery:
+            adapter._voice_response_pending = {
+                111: ("42", time.monotonic(), turn_id, action_id)
+            }
+            assert await adapter.play_in_voice_channel(111, "/tmp/x.mp3") is True
+            adapter._voice_response_pending = {
+                111: ("42", time.monotonic(), turn_id, action_id)
+            }
+            assert await adapter.play_in_voice_channel(111, "/tmp/x.mp3") is True
+
+        mixer.play_speech.assert_called_once()
+        assert emit_delivery.call_args_list[-1].kwargs["delivered"] is False
+
+    @pytest.mark.asyncio
+    async def test_mixer_timeout_does_not_emit_a_successful_delivery_receipt(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = _make_adapter()
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        adapter._voice_clients[111] = vc
+        mixer = MagicMock()
+        mixer.speech_active = True
+        adapter._voice_mixers[111] = mixer
+        adapter._voice_text_channels[111] = 123
+        adapter._reset_voice_timeout = MagicMock()
+        action_id = "voice-output:discord:111:123:answer-1"
+        turn_id = "voice-turn:discord:111:123:answer-1"
+        adapter._voice_response_pending = {
+            111: ("42", time.monotonic(), turn_id, action_id)
+        }
+        adapter._voice_active_turn_ids = {111: turn_id}
+        adapter._voice_active_action_ids = {111: action_id}
+
+        original_timeout = DiscordAdapter.PLAYBACK_TIMEOUT
+        DiscordAdapter.PLAYBACK_TIMEOUT = 0
+        try:
+            with patch.object(vm, "decode_to_pcm", return_value=b"\x00" * vm.FRAME_SIZE), \
+                    patch("gateway.voice_lifecycle.emit_voice_response_start"), \
+                    patch("gateway.voice_lifecycle.emit_voice_delivery") as emit_delivery:
+                assert await adapter.play_in_voice_channel(111, "/tmp/x.mp3") is True
+        finally:
+            DiscordAdapter.PLAYBACK_TIMEOUT = original_timeout
+
+        assert emit_delivery.call_args.kwargs["delivered"] is False
+
+    def test_delivery_receipt_requires_active_turn_and_action_pair(self):
+        adapter = _make_adapter()
+        adapter._voice_text_channels[111] = 123
+        adapter._voice_active_turn_ids = {111: "turn-2"}
+        adapter._voice_active_action_ids = {111: "action-1"}
+
+        with patch("gateway.voice_lifecycle.emit_voice_delivery") as emit_delivery:
+            adapter._emit_voice_delivery(
+                111,
+                ("42", "turn-1", "action-1"),
+                delivered=True,
+            )
+
+        assert emit_delivery.call_args.kwargs["delivered"] is False
 
 
 class TestPlayAckInVoice:

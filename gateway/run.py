@@ -40,6 +40,7 @@ import tempfile
 import threading
 import time
 import sqlite3
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -13241,6 +13242,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # after connection is not lost.
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = self._handle_voice_channel_input
+        if hasattr(adapter, "_voice_speech_start_callback"):
+            adapter._voice_speech_start_callback = self._handle_voice_speech_start
         if hasattr(adapter, "_on_voice_disconnect"):
             adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
         # Let the adapter's inactivity timer see the live voice-reply mode so it
@@ -13264,6 +13267,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return f"Failed to join voice channel: {e}"
 
         if success:
+            try:
+                from gateway.voice_lifecycle import emit_voice_session_start
+
+                emit_voice_session_start(
+                    f"discord:{guild_id}:{event.source.chat_id}",
+                    subject_id=str(event.source.user_id),
+                    origin="discord_voice_channel",
+                )
+            except Exception:
+                logger.debug("voice session start hook failed", exc_info=True)
             adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
             if hasattr(adapter, "_voice_sources"):
                 adapter._voice_sources[guild_id] = event.source.to_dict()
@@ -13299,9 +13312,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
+        if hasattr(adapter, "_voice_speech_start_callback"):
+            adapter._voice_speech_start_callback = None
+        try:
+            from gateway.voice_lifecycle import emit_voice_session_end
+
+            emit_voice_session_end(
+                f"discord:{guild_id}:{event.source.chat_id}",
+                subject_id=str(event.source.user_id),
+                origin="discord_voice_channel",
+            )
+        except Exception:
+            logger.debug("voice session end hook failed", exc_info=True)
         return "Left voice channel."
 
-    def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
+    def _handle_voice_timeout_cleanup(
+        self,
+        chat_id: str,
+        *,
+        guild_id: int | None = None,
+        source: dict | None = None,
+    ) -> None:
         """Called by the adapter when a voice channel times out.
 
         Cleans up runner-side voice_mode state that the adapter cannot reach.
@@ -13310,6 +13341,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._save_voice_modes()
         adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+        subject_id = str((source or {}).get("user_id", "")).strip()
+        if guild_id is None or not subject_id:
+            return
+        try:
+            from gateway.voice_lifecycle import emit_voice_session_end
+
+            emit_voice_session_end(
+                f"discord:{guild_id}:{chat_id}",
+                subject_id=subject_id,
+                origin="discord_voice_channel",
+            )
+        except Exception:
+            logger.debug("voice timeout hook failed", exc_info=True)
+
+    def _handle_voice_speech_start(
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        detected_at_monotonic: float | None = None,
+    ) -> None:
+        """Cancel outbound audio as soon as decoded user speech starts."""
+        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is None or not hasattr(adapter, "interrupt_voice_playback"):
+            return
+        active_actions = getattr(adapter, "_voice_active_action_ids", {})
+        active_turns = getattr(adapter, "_voice_active_turn_ids", {})
+        action_id = active_actions.get(guild_id)
+        turn_id = active_turns.get(guild_id)
+        if not adapter.interrupt_voice_playback(guild_id):
+            return
+        stopped_at = time.monotonic()
+        latency_ms = None
+        if detected_at_monotonic is not None:
+            latency_ms = max(0.0, (stopped_at - detected_at_monotonic) * 1000)
+        text_channel_id = getattr(adapter, "_voice_text_channels", {}).get(guild_id, "")
+        voice_session_id = f"discord:{guild_id}:{text_channel_id}"
+        if not turn_id or not action_id:
+            return
+        if active_turns.get(guild_id) == turn_id:
+            active_turns.pop(guild_id, None)
+        if active_actions.get(guild_id) == action_id:
+            active_actions.pop(guild_id, None)
+        try:
+            from gateway.voice_lifecycle import emit_voice_barge_in
+
+            emit_voice_barge_in(
+                voice_session_id,
+                subject_id=str(user_id),
+                turn_id=turn_id,
+                action_id=action_id,
+                origin="discord_voice_channel",
+                latency_ms=latency_ms,
+            )
+        except Exception:
+            logger.debug("voice barge-in hook failed", exc_info=True)
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
         """Suppress repeated STT outputs for the same recent utterance.
@@ -13398,6 +13485,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
+        voice_session_id = f"discord:{guild_id}:{text_ch_id}"
+        correlation_id = uuid.uuid4().hex
+        turn_id = f"voice-turn:{voice_session_id}:{correlation_id}"
+        action_id = f"voice-output:{voice_session_id}:{correlation_id}"
+        response_marker = (str(user_id), time.monotonic(), turn_id, action_id)
+        response_pending = getattr(adapter, "_voice_response_pending", None)
+        if isinstance(response_pending, dict):
+            response_pending[guild_id] = response_marker
+        active_turns = getattr(adapter, "_voice_active_turn_ids", None)
+        if isinstance(active_turns, dict):
+            active_turns[guild_id] = turn_id
+        active_actions = getattr(adapter, "_voice_active_action_ids", None)
+        if isinstance(active_actions, dict):
+            active_actions[guild_id] = action_id
+
+        try:
+            from gateway.voice_lifecycle import emit_voice_transcript
+
+            emit_voice_transcript(
+                voice_session_id,
+                subject_id=str(user_id),
+                text=transcript,
+                final=True,
+                origin="discord_voice_channel",
+                turn_id=turn_id,
+                action_id=action_id,
+            )
+        except Exception:
+            logger.debug("voice transcript hook failed", exc_info=True)
+
         # Show transcript in text channel (after auth, with mention sanitization)
         try:
             channel = adapter._client.get_channel(text_ch_id)
@@ -13418,7 +13535,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
         )
 
-        await adapter.handle_message(event)
+        try:
+            await adapter.handle_message(event)
+        finally:
+            if (
+                isinstance(response_pending, dict)
+                and response_pending.get(guild_id) == response_marker
+            ):
+                response_pending.pop(guild_id, None)
+            if isinstance(active_turns, dict) and active_turns.get(guild_id) == turn_id:
+                active_turns.pop(guild_id, None)
+            if isinstance(active_actions, dict) and active_actions.get(guild_id) == action_id:
+                active_actions.pop(guild_id, None)
 
     def _should_send_voice_reply(
         self,
