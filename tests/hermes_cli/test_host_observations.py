@@ -84,3 +84,36 @@ def test_plugin_context_exposes_location_without_secrets(monkeypatch):
         "latitude",
         "longitude",
     }
+
+
+def test_plugin_context_exposes_configured_activity_port_without_process_name(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "gateway:\n"
+        "  activity_observation:\n"
+        "    process_name: private-game.exe\n"
+        "    label: Configured application\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    context = PluginContext(
+        PluginManifest(name="activity-consumer", key="activity-consumer"),
+        PluginManager(),
+    )
+
+    capabilities = context.get_host_capabilities()
+    observations = context.get_host_observations()
+
+    assert context.activity_observation_port.available
+    assert capabilities["activity"] == {"observation": True}
+    assert observations["activity"] == {
+        "available": True,
+        "source": "local_process",
+    }
+    assert "private-game.exe" not in str(capabilities)
+    assert "private-game.exe" not in str(observations)

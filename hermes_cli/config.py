@@ -2957,6 +2957,15 @@ DEFAULT_CONFIG = {
             "enabled": False,
         },
 
+        # Optional, explicitly granted local-application lifecycle observation.
+        # The host compares only this one process name and emits the configured
+        # opaque label; it never exposes PIDs, command lines, window titles, or
+        # unrelated process names to plugins.
+        "activity_observation": {
+            "process_name": "",
+            "label": "Configured application",
+        },
+
         # Maximum bytes for an inbound image / audio / video payload the
         # gateway will buffer into memory and cache to disk. Inbound media is
         # read fully into RAM before being written, so an unbounded upload

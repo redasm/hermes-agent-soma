@@ -143,6 +143,14 @@ VALID_HOOKS: Set[str] = {
     "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
+    # Generic host voice lifecycle events.  Payloads contain transport and
+    # delivery metadata only; domain meaning belongs to consuming plugins.
+    "voice_session_start",
+    "voice_transcript",
+    "voice_barge_in",
+    "voice_response_start",
+    "voice_delivery",
+    "voice_session_end",
     # Scheduled-turn context provider. A cron job explicitly names a provider;
     # matching plugins may return bounded context for that one turn only.
     "cron_context",
@@ -352,6 +360,7 @@ class PluginContext:
         self._manager = manager
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
+        self._activity_observation_port: Any = None
 
     def get_host_capabilities(self) -> Dict[str, Any]:
         """Return the versioned runtime surface currently available to a plugin.
@@ -378,6 +387,9 @@ class PluginContext:
                 "delivery_receipts": "cron_delivery" in VALID_HOOKS,
                 "text_only": True,
                 "attach_to_session": True,
+            },
+            "activity": {
+                "observation": self.activity_observation_port.available,
             },
             "tools": {
                 "names": sorted(names),
@@ -406,6 +418,10 @@ class PluginContext:
                 "authorization": "unknown",
                 "source": "host_browser",
             },
+            "activity": {
+                "available": capabilities["activity"]["observation"],
+                "source": "local_process",
+            },
         }
 
     def get_location_observation(self) -> Dict[str, Any]:
@@ -413,6 +429,26 @@ class PluginContext:
         from hermes_cli.host_observations import observe_location
 
         return observe_location()
+
+    @property
+    def activity_observation_port(self) -> Any:
+        """Return the profile's optional privacy-minimal activity port."""
+        if self._activity_observation_port is None:
+            from gateway.activity_observation import LocalApplicationObservationPort
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+            gateway = config.get("gateway") if isinstance(config, dict) else {}
+            settings = (
+                gateway.get("activity_observation") if isinstance(gateway, dict) else {}
+            )
+            if not isinstance(settings, dict):
+                settings = {}
+            self._activity_observation_port = LocalApplicationObservationPort(
+                process_name=settings.get("process_name"),
+                label=settings.get("label"),
+            )
+        return self._activity_observation_port
 
     # -- host-owned LLM access ----------------------------------------------
 
