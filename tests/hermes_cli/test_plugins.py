@@ -623,6 +623,30 @@ class TestPluginLoading:
 class TestPluginHooks:
     """Tests for lifecycle hook registration and invocation."""
 
+    def test_activity_observation_is_a_supported_host_hook(self, caplog):
+        manager = PluginManager()
+        context = PluginContext(
+            PluginManifest(name="activity-consumer", key="activity-consumer"),
+            manager,
+        )
+        received = []
+
+        with caplog.at_level(logging.WARNING):
+            context.register_hook(
+                "activity_observation",
+                lambda **event: received.append(event),
+            )
+
+        manager.invoke_hook("activity_observation", session_id="presence:1")
+
+        assert received == [
+            {
+                "session_id": "presence:1",
+                "telemetry_schema_version": "hermes.observer.v1",
+            }
+        ]
+        assert "unknown hook 'activity_observation'" not in caplog.text
+
     def test_valid_hooks_include_request_scoped_api_hooks(self):
         assert "pre_api_request" in VALID_HOOKS
         assert "post_api_request" in VALID_HOOKS

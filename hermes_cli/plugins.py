@@ -151,6 +151,9 @@ VALID_HOOKS: Set[str] = {
     "voice_response_start",
     "voice_delivery",
     "voice_session_end",
+    # Low-rate, structured host activity observations. High-rate telemetry or
+    # raw screen/audio data belongs on a separate transport data plane.
+    "activity_observation",
     # Scheduled-turn context provider. A cron job explicitly names a provider;
     # matching plugins may return bounded context for that one turn only.
     "cron_context",
