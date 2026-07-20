@@ -1298,8 +1298,31 @@ def _strip_edge_self_mentions(
 def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     """Run the official Lark WS client in its own thread-local event loop."""
     import lark_oapi.ws.client as ws_client_module
+    from websockets.exceptions import ConnectionClosedOK
 
     loop = asyncio.new_event_loop()
+
+    class IgnoreNormalShutdownClose(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            message = record.getMessage()
+            normal_close = (
+                "receive message loop exit" in message
+                and "sent 1000 (OK)" in message
+                and "received 1000 (OK)" in message
+            )
+            return adapter._running or not normal_close
+
+    def handle_loop_exception(_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        exception = context.get("exception")
+        if not adapter._running and isinstance(exception, ConnectionClosedOK):
+            logger.debug("[Feishu] WebSocket closed normally during shutdown")
+            return
+        _loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handle_loop_exception)
+    sdk_logger = logging.getLogger("Lark")
+    normal_close_filter = IgnoreNormalShutdownClose()
+    sdk_logger.addFilter(normal_close_filter)
     asyncio.set_event_loop(loop)
     ws_client_module.loop = loop
     adapter._ws_thread_loop = loop
@@ -1339,6 +1362,7 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     except Exception:
         pass
     finally:
+        sdk_logger.removeFilter(normal_close_filter)
         ws_client_module.websockets.connect = original_connect
         if original_configure is not None:
             setattr(ws_client, "_configure", original_configure)

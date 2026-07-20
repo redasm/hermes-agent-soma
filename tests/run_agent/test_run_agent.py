@@ -650,6 +650,18 @@ class TestExtractReasoning:
         msg = _mock_assistant_msg()
         assert agent._extract_reasoning(msg) is None
 
+    def test_dynamic_mock_reasoning_fields_are_ignored(self, agent):
+        assert agent._extract_reasoning(MagicMock(content="Hello")) is None
+
+    def test_non_string_reasoning_fields_are_ignored(self, agent):
+        msg = _mock_assistant_msg(
+            reasoning={"text": "not a supported reasoning field"},
+            reasoning_content=42,
+            reasoning_details=[{"summary": ["not", "text"]}],
+        )
+
+        assert agent._extract_reasoning(msg) is None
+
     def test_combined_reasoning(self, agent):
         msg = _mock_assistant_msg(
             reasoning="part1",

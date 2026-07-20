@@ -702,6 +702,7 @@ class TestAdapterModule(unittest.TestCase):
             from plugins.platforms.feishu.adapter import _run_official_feishu_ws_client
 
             _run_official_feishu_ws_client(fake_client, fake_adapter)
+
         finally:
             sys.modules.clear()
             sys.modules.update(original_modules)
@@ -710,6 +711,39 @@ class TestAdapterModule(unittest.TestCase):
         self.assertEqual(fake_client._reconnect_nonce, 2)
         self.assertEqual(fake_client._reconnect_interval, 3)
         self.assertEqual(fake_client._ping_interval, 4)
+
+    def test_official_ws_runner_consumes_normal_close_task_exception(self):
+        from websockets.exceptions import ConnectionClosedOK
+        from websockets.frames import Close
+
+        from plugins.platforms.feishu.adapter import _run_official_feishu_ws_client
+
+        class _FakeWSClient:
+            def start(self):
+                loop = asyncio.get_event_loop()
+
+                async def close_normally():
+                    import logging
+
+                    logging.getLogger("Lark").error(
+                        "receive message loop exit, err: sent 1000 (OK); "
+                        "then received 1000 (OK) bye"
+                    )
+                    raise ConnectionClosedOK(Close(1000, "bye"), Close(1000, ""), False)
+
+                loop.create_task(close_normally())
+                loop.run_until_complete(asyncio.sleep(0))
+
+        adapter = SimpleNamespace(
+            _running=False,
+            _ws_thread_loop=None,
+            _ws_reconnect_nonce=30,
+            _ws_reconnect_interval=120,
+            _ws_ping_interval=None,
+            _ws_ping_timeout=None,
+        )
+        with self.assertNoLogs(level="ERROR"):
+            _run_official_feishu_ws_client(_FakeWSClient(), adapter)
 
 
 def _admits_group(adapter, message, sender_id, chat_id=""):
