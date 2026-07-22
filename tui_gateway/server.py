@@ -15359,6 +15359,25 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5032, str(e))
 
 
+@method("plugin.inspect")
+def _(rid, params: dict) -> dict:
+    plugin = str(params.get("plugin") or "").strip()
+    if not plugin:
+        return _err(rid, 4000, "plugin required")
+    try:
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        manager = _ensure_plugins_discovered()
+        inspector_params = {
+            key: value for key, value in params.items() if key != "plugin"
+        }
+        return _ok(rid, manager.inspect_plugin(plugin, inspector_params))
+    except KeyError:
+        return _err(rid, 4040, f"plugin inspector not found: {plugin}")
+    except Exception as exc:
+        return _err(rid, 5033, str(exc))
+
+
 @method("config.show")
 def _(rid, params: dict) -> dict:
     try:

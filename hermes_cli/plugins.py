@@ -1327,6 +1327,20 @@ class PluginContext:
         self._manager._hooks.setdefault(hook_name, []).append(callback)
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
+    def register_inspector(
+        self, callback: Callable[[Dict[str, Any]], Dict[str, Any]]
+    ) -> None:
+        """Register one read-only diagnostic snapshot provider for this plugin.
+
+        Inspectors are host-facing observability endpoints. They are not model
+        tools and must not mutate plugin state.
+        """
+        key = self.manifest.key or self.manifest.name
+        if key in self._manager._inspectors:
+            raise ValueError(f"inspector already registered for plugin {key!r}")
+        self._manager._inspectors[key] = callback
+        logger.debug("Plugin %s registered inspector", self.manifest.name)
+
     # -- middleware registration -------------------------------------------
 
     def register_middleware(self, kind: str, callback: Callable) -> None:
@@ -1419,6 +1433,8 @@ class PluginManager:
         # Plugin-registered auxiliary tasks: key → {key, display_name,
         # description, defaults, plugin}. See PluginContext.register_auxiliary_task.
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
+        # Plugin key -> read-only diagnostic snapshot callback.
+        self._inspectors: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
         # Slack Block Kit action handlers registered by plugins. Each entry
         # is (matcher, callback, plugin_name); the Slack adapter wires them
         # into its slack_bolt App at connect() time. ``matcher`` is whatever
@@ -1430,6 +1446,18 @@ class PluginManager:
     # -----------------------------------------------------------------------
     # Public
     # -----------------------------------------------------------------------
+
+    def inspect_plugin(
+        self, plugin: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Return a plugin's sanitized read-only diagnostic snapshot."""
+        callback = self._inspectors.get(plugin)
+        if callback is None:
+            raise KeyError(plugin)
+        result = callback(dict(params or {}))
+        if not isinstance(result, dict):
+            raise TypeError("plugin inspector must return an object")
+        return result
 
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.
@@ -1454,6 +1482,7 @@ class PluginManager:
             self._plugin_commands.clear()
             self._plugin_skills.clear()
             self._aux_tasks.clear()
+            self._inspectors.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
