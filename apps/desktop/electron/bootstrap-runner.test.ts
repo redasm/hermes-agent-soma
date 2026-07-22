@@ -12,6 +12,7 @@ import {
   hasExistingGitCheckout,
   installedAgentInstallScript,
   installRefForStamp,
+  installScriptUrl,
   isPinnedCommit,
   resolveInstallScript,
   resolveMarkerPinnedCommit,
@@ -129,6 +130,18 @@ test('fallback install stamps use an unpinned branch ref', () => {
     }),
     ['--dir', '/tmp/hermes', '--hermes-home', '/tmp/home', '--branch', 'main']
   )
+})
+
+test('packaged bootstrap installs the Soma fork that owns the stamped commit', () => {
+  const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
+  const windowsInstaller = fs.readFileSync(path.join(repoRoot, 'scripts', 'install.ps1'), 'utf8')
+
+  assert.equal(
+    installScriptUrl('abc1234'),
+    `https://raw.githubusercontent.com/redasm/hermes-agent-soma/abc1234/scripts/${SCRIPT_NAME}`
+  )
+  assert.match(windowsInstaller, /github\.com\/redasm\/hermes-agent-soma\.git/)
+  assert.match(windowsInstaller, /github\.com\/redasm\/hermes-agent-soma\/archive/)
 })
 
 test('resolveMarkerPinnedCommit prefers real HEAD over fallback stamp zeros', () => {
