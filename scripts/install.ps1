@@ -1467,6 +1467,8 @@ function Install-Repository {
                 # users hit on update. Pin autocrlf=false so the dirt is never
                 # created in the first place.
                 git -c windows.appendAtomically=false config core.autocrlf false 2>$null
+                git -c windows.appendAtomically=false remote set-url origin $RepoUrlHttps
+                if ($LASTEXITCODE -ne 0) { throw "git remote set-url failed (exit $LASTEXITCODE)" }
                 Discard-LockfileChurn $InstallDir
                 # Preserve any real local changes before the checkout instead of
                 # discarding them with `reset --hard HEAD`. The old hard reset

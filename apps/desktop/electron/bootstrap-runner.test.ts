@@ -142,6 +142,7 @@ test('packaged bootstrap installs the Soma fork that owns the stamped commit', (
   )
   assert.match(windowsInstaller, /github\.com\/redasm\/hermes-agent-soma\.git/)
   assert.match(windowsInstaller, /github\.com\/redasm\/hermes-agent-soma\/archive/)
+  assert.match(windowsInstaller, /git .*remote set-url origin \$RepoUrlHttps/)
 })
 
 test('resolveMarkerPinnedCommit prefers real HEAD over fallback stamp zeros', () => {
