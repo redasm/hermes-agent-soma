@@ -163,6 +163,8 @@ VALID_HOOKS: Set[str] = {
     # Durable host-neutral one-shot deadline. Payload contains typed identity
     # and timing metadata only; prompts and plugin domain types are forbidden.
     "scheduled_event_due",
+    # Content-free claim/ack/nack lifecycle for operational observers.
+    "scheduled_event_lifecycle",
     # Typed receipt for content returned from scheduled_event_due. Correlates
     # only opaque host/plugin identities; user content is never echoed here.
     "scheduled_outreach_delivery",
@@ -404,6 +406,8 @@ class PluginContext:
                 "durable": True,
                 "cancel": True,
                 "dedupe": True,
+                "lease": True,
+                "ack_nack": True,
             },
             "activity": {
                 "observation": self.activity_observation_port.available,
@@ -2093,22 +2097,28 @@ class PluginManager:
         are reused.  All injected context is ephemeral — never
         persisted to session DB.
         """
+        results, _error_count = self.invoke_hook_report(hook_name, **kwargs)
+        return results
+
+    def invoke_hook_report(self, hook_name: str, **kwargs: Any) -> tuple[List[Any], int]:
+        """Invoke a hook and report isolated callback failures to durable consumers."""
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
-        callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
-        for cb in callbacks:
+        error_count = 0
+        for cb in self._hooks.get(hook_name, []):
             try:
                 ret = cb(**kwargs)
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
+                error_count += 1
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
                     hook_name,
                     getattr(cb, "__name__", repr(cb)),
                     exc,
                 )
-        return results
+        return results, error_count
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""

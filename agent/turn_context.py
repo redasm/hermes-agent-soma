@@ -693,6 +693,12 @@ def build_turn_context(
     plugin_user_context = ""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
+        platform = getattr(agent, "platform", None) or ""
+        turn_origin = (
+            platform.lower()
+            if platform.lower() in {"cron", "scheduler", "system", "tool"}
+            else "user"
+        )
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
@@ -702,8 +708,10 @@ def build_turn_context(
             conversation_history=list(messages),
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
+            platform=platform,
             sender_id=getattr(agent, "_user_id", None) or "",
+            subject_id="user:local",
+            turn_origin=turn_origin,
         )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin

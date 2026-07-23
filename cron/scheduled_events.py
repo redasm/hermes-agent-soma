@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -89,7 +89,12 @@ class ScheduledEventStore:
         return sorted(events, key=lambda event: (event.get("due_at", ""), event["event_id"]))
 
     def claim_due(
-        self, *, now: datetime | None = None, limit: int | None = None
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int | None = None,
+        lease_seconds: int = 300,
+        max_attempts: int = 5,
     ) -> list[dict[str, Any]]:
         current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         with _jobs_lock():
@@ -97,7 +102,7 @@ class ScheduledEventStore:
             due = [
                 event
                 for event in events
-                if event.get("status") == "pending"
+                if self._claimable(event, current_time, max_attempts)
                 and _parse_timestamp(event["due_at"]) <= current_time
             ]
             due.sort(key=lambda event: (event["due_at"], event["event_id"]))
@@ -107,10 +112,96 @@ class ScheduledEventStore:
             for event in due:
                 event["status"] = "claimed"
                 event["claimed_at"] = claimed_at
+                event["lease_expires_at"] = (
+                    current_time + timedelta(seconds=max(1, lease_seconds))
+                ).isoformat()
                 event["claim_id"] = uuid.uuid4().hex
+                event["attempt_count"] = int(event.get("attempt_count", 0)) + 1
             if due:
                 self._save(events)
         return [dict(event) for event in due]
+
+    def ack(self, event_id: str, generation: int, claim_id: str) -> bool:
+        return self._finish_claim(
+            event_id,
+            generation,
+            claim_id,
+            status="completed",
+        )
+
+    def nack(
+        self,
+        event_id: str,
+        generation: int,
+        claim_id: str,
+        *,
+        error_category: str,
+        retryable: bool,
+        max_attempts: int = 5,
+    ) -> bool:
+        with _jobs_lock():
+            events = self._load()
+            event = self._matching_claim(events, event_id, generation, claim_id)
+            if event is None:
+                return False
+            attempts = int(event.get("attempt_count", 0))
+            event["status"] = (
+                "failed_retryable" if retryable and attempts < max_attempts else "failed_terminal"
+            )
+            event["last_error_category"] = str(error_category or "unknown")[:80]
+            event["failed_at"] = datetime.now(timezone.utc).isoformat()
+            self._save(events)
+            return True
+
+    def _finish_claim(
+        self,
+        event_id: str,
+        generation: int,
+        claim_id: str,
+        *,
+        status: str,
+    ) -> bool:
+        with _jobs_lock():
+            events = self._load()
+            event = self._matching_claim(events, event_id, generation, claim_id)
+            if event is None:
+                return False
+            event["status"] = status
+            event["completed_at"] = datetime.now(timezone.utc).isoformat()
+            self._save(events)
+            return True
+
+    @staticmethod
+    def _matching_claim(
+        events: list[dict[str, Any]], event_id: str, generation: int, claim_id: str
+    ) -> dict[str, Any] | None:
+        return next(
+            (
+                event
+                for event in events
+                if event.get("event_id") == event_id
+                and int(event.get("generation", 0)) == int(generation)
+                and event.get("claim_id") == claim_id
+                and event.get("status") == "claimed"
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _claimable(
+        event: dict[str, Any], current_time: datetime, max_attempts: int
+    ) -> bool:
+        status = event.get("status")
+        if status == "pending":
+            return True
+        if status == "failed_retryable":
+            return int(event.get("attempt_count", 0)) < max_attempts
+        if status != "claimed":
+            return False
+        lease_expires_at = event.get("lease_expires_at")
+        if not lease_expires_at:
+            return True
+        return _parse_timestamp(lease_expires_at) <= current_time
 
     @staticmethod
     def _required(value: str, name: str) -> str:
@@ -154,12 +245,14 @@ def dispatch_due_scheduled_events(
     loop: Any = None,
 ) -> int:
     """Claim and notify due events only when a plugin consumer is ready."""
-    from hermes_cli.plugins import has_hook, invoke_hook
+    from hermes_cli.plugins import get_plugin_manager, has_hook, invoke_hook
 
     if not has_hook("scheduled_event_due"):
         return 0
-    claimed = (store or ScheduledEventStore()).claim_due()
+    event_store = store or ScheduledEventStore()
+    claimed = event_store.claim_due()
     for event in claimed:
+        _emit_lifecycle(invoke_hook, event, "claimed")
         due_events = [
             {
                 "event_id": candidate["event_id"],
@@ -173,7 +266,7 @@ def dispatch_due_scheduled_events(
             for candidate in claimed
             if candidate["subject_id"] == event["subject_id"]
         ]
-        results = invoke_hook(
+        results, error_count = get_plugin_manager().invoke_hook_report(
             "scheduled_event_due",
             event_id=event["event_id"],
             subject_id=event["subject_id"],
@@ -184,6 +277,21 @@ def dispatch_due_scheduled_events(
             claim_id=event["claim_id"],
             due_events=due_events,
         )
+        if error_count:
+            event_store.nack(
+                event["event_id"],
+                event["generation"],
+                event["claim_id"],
+                error_category="consumer_error",
+                retryable=True,
+            )
+            _emit_lifecycle(
+                invoke_hook,
+                event,
+                "failed_retryable",
+                error_category="consumer_error",
+            )
+            continue
         request = next(
             (
                 result
@@ -193,8 +301,30 @@ def dispatch_due_scheduled_events(
             None,
         )
         if request is None:
+            event_store.ack(event["event_id"], event["generation"], event["claim_id"])
+            _emit_lifecycle(invoke_hook, event, "completed")
             continue
-        receipt = (deliver or _deliver_outreach)(event, request, adapters=adapters, loop=loop) if deliver is None else deliver(event, request)
+        try:
+            receipt = (
+                _deliver_outreach(event, request, adapters=adapters, loop=loop)
+                if deliver is None
+                else deliver(event, request)
+            )
+        except Exception:
+            event_store.nack(
+                event["event_id"],
+                event["generation"],
+                event["claim_id"],
+                error_category="delivery_error",
+                retryable=True,
+            )
+            _emit_lifecycle(
+                invoke_hook,
+                event,
+                "failed_retryable",
+                error_category="delivery_error",
+            )
+            continue
         invoke_hook(
             "scheduled_outreach_delivery",
             event_id=event["event_id"],
@@ -207,7 +337,37 @@ def dispatch_due_scheduled_events(
             targets=list(receipt.get("targets") or []),
             error=receipt.get("error"),
         )
+        event_store.ack(event["event_id"], event["generation"], event["claim_id"])
+        _emit_lifecycle(invoke_hook, event, "completed")
     return len(claimed)
+
+
+def _emit_lifecycle(
+    invoke_hook: Callable[..., Any],
+    event: dict[str, Any],
+    transition: str,
+    *,
+    error_category: str = "",
+) -> None:
+    try:
+        due_at = _parse_timestamp(event["due_at"])
+        invoke_hook(
+            "scheduled_event_lifecycle",
+            event_id=event["event_id"],
+            subject_id=event["subject_id"],
+            event_type=event["event_type"],
+            generation=event["generation"],
+            claim_id=event.get("claim_id", ""),
+            transition=transition,
+            error_category=error_category,
+            attempt_count=int(event.get("attempt_count", 0)),
+            lateness_seconds=max(
+                0.0,
+                (datetime.now(timezone.utc) - due_at).total_seconds(),
+            ),
+        )
+    except Exception:
+        return
 
 
 def _valid_outreach_request(value: object, subject_id: str) -> bool:

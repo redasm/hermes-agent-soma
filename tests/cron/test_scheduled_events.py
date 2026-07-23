@@ -65,16 +65,87 @@ def test_cancelled_event_never_becomes_due(tmp_path):
     assert store.cancel("deadline-1") is False
 
 
-def test_claim_is_durable_and_overdue_event_is_not_replayed(tmp_path):
+def test_unfinished_claim_is_recovered_after_its_lease_expires(tmp_path):
     path = tmp_path / "scheduled_events.json"
     ScheduledEventStore(path).upsert(**_event())
 
-    claimed = ScheduledEventStore(path).claim_due()
+    now = datetime.now(timezone.utc)
+    claimed = ScheduledEventStore(path).claim_due(now=now, lease_seconds=30)
     after_restart = ScheduledEventStore(path)
 
     assert len(claimed) == 1
-    assert after_restart.claim_due() == []
-    assert after_restart.snapshot("user:local")[0]["status"] == "claimed"
+    assert after_restart.claim_due(now=now + timedelta(seconds=29)) == []
+    recovered = after_restart.claim_due(now=now + timedelta(seconds=30))
+    assert len(recovered) == 1
+    assert recovered[0]["claim_id"] != claimed[0]["claim_id"]
+    assert recovered[0]["attempt_count"] == 2
+
+
+def test_ack_and_nack_require_the_current_claim_identity(tmp_path):
+    store = ScheduledEventStore(tmp_path / "scheduled_events.json")
+    store.upsert(**_event())
+    claimed = store.claim_due()[0]
+
+    assert store.ack(
+        claimed["event_id"], claimed["generation"], "wrong-claim"
+    ) is False
+    assert store.nack(
+        claimed["event_id"],
+        claimed["generation"],
+        claimed["claim_id"],
+        error_category="consumer_error",
+        retryable=True,
+    ) is True
+    failed = store.snapshot("user:local")[0]
+    assert failed["status"] == "failed_retryable"
+    assert failed["last_error_category"] == "consumer_error"
+
+
+def test_successful_dispatch_completes_the_claim(tmp_path, monkeypatch):
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="consumer", source="test"), manager)
+    context.register_hook("scheduled_event_due", lambda **_event: None)
+    lifecycle = []
+    context.register_hook(
+        "scheduled_event_lifecycle", lambda **event: lifecycle.append(event)
+    )
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+    store = ScheduledEventStore(tmp_path / "scheduled_events.json")
+    store.upsert(**_event())
+
+    assert dispatch_due_scheduled_events(store=store) == 1
+    assert store.snapshot("user:local")[0]["status"] == "completed"
+    assert [event["transition"] for event in lifecycle] == ["claimed", "completed"]
+    assert lifecycle[0]["attempt_count"] == 1
+
+
+def test_consumer_exception_is_retryable_instead_of_permanently_claimed(
+    tmp_path, monkeypatch
+):
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="consumer", source="test"), manager)
+
+    def fail(**_event):
+        raise RuntimeError("consumer broke")
+
+    context.register_hook("scheduled_event_due", fail)
+    lifecycle = []
+    context.register_hook(
+        "scheduled_event_lifecycle", lambda **event: lifecycle.append(event)
+    )
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+    store = ScheduledEventStore(tmp_path / "scheduled_events.json")
+    store.upsert(**_event())
+
+    assert dispatch_due_scheduled_events(store=store) == 1
+    failed = store.snapshot("user:local")[0]
+    assert failed["status"] == "failed_retryable"
+    assert failed["last_error_category"] == "consumer_error"
+    assert [event["transition"] for event in lifecycle] == [
+        "claimed",
+        "failed_retryable",
+    ]
+    assert lifecycle[-1]["error_category"] == "consumer_error"
 
 
 def test_plugin_context_exposes_host_neutral_scheduled_event_contract(tmp_path):
@@ -93,6 +164,8 @@ def test_plugin_context_exposes_host_neutral_scheduled_event_contract(tmp_path):
         "durable": True,
         "cancel": True,
         "dedupe": True,
+        "lease": True,
+        "ack_nack": True,
     }
     assert "prompt" not in saved
 

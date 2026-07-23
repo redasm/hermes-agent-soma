@@ -402,6 +402,78 @@ class TestConversationLoopPartialStreamContinuation:
         assert "first half of" in result["final_response"]
         assert "forty-two" in result["final_response"]
 
+    def test_visible_partial_stream_exhaustion_fires_post_llm_call_once(
+        self, loop_agent, monkeypatch,
+    ):
+        """A delivered partial answer still completes the user-turn lifecycle."""
+        from tests.run_agent.test_run_agent import _mock_assistant_msg
+
+        partial_stub = SimpleNamespace(
+            id=PARTIAL_STREAM_STUB_ID,
+            model="test/model",
+            choices=[SimpleNamespace(
+                index=0,
+                message=_mock_assistant_msg(content="A visible fragment. "),
+                finish_reason=FINISH_REASON_LENGTH,
+            )],
+            usage=None,
+        )
+        loop_agent.client.chat.completions.create.side_effect = [partial_stub] * 4
+        loop_agent.platform = "feishu"
+        loop_agent._user_id = "ou-test-user"
+        hook_calls = []
+
+        def capture_hook(name, **kwargs):
+            if name == "post_llm_call":
+                hook_calls.append(kwargs)
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture_hook)
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("please finish this")
+
+        assert result["partial"] is True
+        assert result["final_response"]
+        assert len(hook_calls) == 1
+        assert hook_calls[0]["turn_id"]
+        assert hook_calls[0]["session_id"] == loop_agent.session_id
+        assert hook_calls[0]["subject_id"] == "user:local"
+        assert hook_calls[0]["sender_id"] == "ou-test-user"
+        assert hook_calls[0]["turn_origin"] == "user"
+
+    def test_user_turn_pre_and_post_hooks_share_correlation(self, loop_agent, monkeypatch):
+        from tests.run_agent.test_run_agent import _mock_response
+
+        loop_agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done.", finish_reason="stop"
+        )
+        loop_agent.platform = "feishu"
+        hook_calls = []
+
+        def capture_hook(name, **kwargs):
+            if name in {"pre_llm_call", "post_llm_call"}:
+                hook_calls.append((name, kwargs))
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture_hook)
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            loop_agent.run_conversation("hello")
+
+        pre = next(payload for name, payload in hook_calls if name == "pre_llm_call")
+        post = next(payload for name, payload in hook_calls if name == "post_llm_call")
+        assert pre["session_id"] == post["session_id"]
+        assert pre["turn_id"] == post["turn_id"]
+        assert pre["subject_id"] == post["subject_id"] == "user:local"
+        assert pre["turn_origin"] == post["turn_origin"] == "user"
+
 
 class TestContentFilterStallActivatesFallback:
     """Regression for #32421: a provider output-layer content safety filter

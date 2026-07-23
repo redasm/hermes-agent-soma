@@ -6368,7 +6368,7 @@ class AIAgent:
         # which may be observed from another thread.
         with scoped_runtime_main({}):
             try:
-                return run_conversation(
+                result = run_conversation(
                     self,
                     user_message,
                     system_message,
@@ -6379,6 +6379,39 @@ class AIAgent:
                     persist_user_timestamp=persist_user_timestamp,
                     moa_config=moa_config,
                 )
+                final_response = result.get("final_response") if result else None
+                if final_response and not result.get("interrupted", False):
+                    try:
+                        from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+                        platform = getattr(self, "platform", None) or ""
+                        turn_origin = (
+                            platform.lower()
+                            if platform.lower() in {"cron", "scheduler", "system", "tool"}
+                            else "user"
+                        )
+                        _invoke_hook(
+                            "post_llm_call",
+                            session_id=self.session_id,
+                            task_id=getattr(self, "_current_task_id", None) or task_id,
+                            turn_id=getattr(self, "_current_turn_id", "") or "",
+                            subject_id="user:local",
+                            sender_id=getattr(self, "_user_id", None) or "",
+                            turn_origin=turn_origin,
+                            user_message=(
+                                persist_user_message
+                                if persist_user_message is not None
+                                else user_message
+                            ),
+                            assistant_response=final_response,
+                            conversation_history=list(result.get("messages") or []),
+                            model=self.model,
+                            platform=platform,
+                            process_id=os.getpid(),
+                        )
+                    except Exception as exc:
+                        logger.warning("post_llm_call hook failed: %s", exc)
+                return result
             finally:
                 reset_accounting_context(acct_token)
                 reset_conversation_context(token)
