@@ -388,21 +388,89 @@ def _deliver_outreach(
 ) -> dict[str, Any]:
     from cron.scheduler import _deliver_result_with_receipt
 
+    origin = _recent_verified_origin(request["subject_id"], adapters)
     job = {
         "id": event["event_id"],
         "name": event["event_type"],
         "deliver": "origin",
-        "origin": None,
+        "origin": origin,
         "response_mode": "text_only",
         "metadata": {
             "action_id": request["action_id"],
             "delivery_attempt_id": request["delivery_attempt_id"],
             "subject_id": request["subject_id"],
+            "route_source": (
+                "recent_verified_session" if origin is not None else "host_configured_home"
+            ),
         },
     }
-    return _deliver_result_with_receipt(
+    receipt = _deliver_result_with_receipt(
         job, request["content"], adapters=adapters, loop=loop
     ).as_dict()
+    if receipt.get("status") == "skipped" and not receipt.get("targets"):
+        return {"status": "failed", "targets": [], "error": "no_verified_route"}
+    return receipt
+
+
+def _recent_verified_origin(subject_id: str, adapters: Any) -> dict[str, Any] | None:
+    if subject_id != "user:local":
+        return None
+    connected = _connected_platforms(adapters)
+    if not connected:
+        return None
+    try:
+        from hermes_state import SessionDB
+
+        database = SessionDB()
+        try:
+            rows = database.list_gateway_sessions(active_only=False)
+        finally:
+            database.close()
+    except Exception:
+        return None
+    for row in rows:
+        origin = _session_origin(row)
+        if origin is None or origin["platform"] not in connected:
+            continue
+        return origin
+    return None
+
+
+def _connected_platforms(adapters: Any) -> set[str]:
+    if not isinstance(adapters, dict):
+        return set()
+    return {
+        str(getattr(platform, "value", platform)).strip().lower()
+        for platform in adapters
+        if str(getattr(platform, "value", platform)).strip()
+    }
+
+
+def _session_origin(row: dict[str, Any]) -> dict[str, Any] | None:
+    origin: dict[str, Any] = {}
+    raw = row.get("origin_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                origin = parsed
+        except (TypeError, ValueError):
+            pass
+    platform = str(origin.get("platform") or row.get("source") or "").strip().lower()
+    chat_id = str(origin.get("chat_id") or row.get("chat_id") or "").strip()
+    chat_type = str(origin.get("chat_type") or row.get("chat_type") or "").strip().lower()
+    if not platform or not chat_id or chat_type not in {"dm", "direct", "private"}:
+        return None
+    selected = {
+        "platform": platform,
+        "chat_id": chat_id,
+        "user_id": str(origin.get("user_id") or row.get("user_id") or "").strip(),
+        "chat_type": chat_type,
+    }
+    thread_id = origin.get("thread_id", row.get("thread_id"))
+    if thread_id not in (None, ""):
+        selected["thread_id"] = str(thread_id)
+    return selected
 
 
 __all__ = ["ScheduledEventStore", "dispatch_due_scheduled_events"]

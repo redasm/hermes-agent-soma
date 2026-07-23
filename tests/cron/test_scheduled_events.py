@@ -3,7 +3,11 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-from cron.scheduled_events import ScheduledEventStore, dispatch_due_scheduled_events
+from cron.scheduled_events import (
+    ScheduledEventStore,
+    _deliver_outreach,
+    dispatch_due_scheduled_events,
+)
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
 
@@ -250,6 +254,122 @@ def test_typed_outreach_request_is_delivered_and_receipted(tmp_path, monkeypatch
             "telemetry_schema_version": "hermes.observer.v1",
         }
     ]
+
+
+def test_typed_outreach_uses_most_recent_connected_direct_session(monkeypatch):
+    class FakeSessionDB:
+        def list_gateway_sessions(self, *, active_only=True):
+            assert active_only is False
+            return [
+                {
+                    "source": "feishu",
+                    "chat_id": "feishu-chat",
+                    "user_id": "feishu-user",
+                    "chat_type": "dm",
+                    "thread_id": None,
+                    "origin_json": (
+                        '{"platform":"feishu","chat_id":"feishu-chat",'
+                        '"user_id":"feishu-user","chat_type":"dm"}'
+                    ),
+                },
+                {
+                    "source": "telegram",
+                    "chat_id": "telegram-chat",
+                    "user_id": "telegram-user",
+                    "chat_type": "dm",
+                    "thread_id": None,
+                    "origin_json": (
+                        '{"platform":"telegram","chat_id":"telegram-chat",'
+                        '"user_id":"telegram-user","chat_type":"dm"}'
+                    ),
+                },
+            ]
+
+        def close(self):
+            return None
+
+    captured = []
+
+    def deliver(job, content, *, adapters=None, loop=None):
+        captured.append((job, content, adapters, loop))
+
+        class Receipt:
+            def as_dict(self):
+                return {
+                    "status": "delivered",
+                    "targets": [{"platform": "feishu", "chat_id": "feishu-chat"}],
+                    "error": None,
+                }
+
+        return Receipt()
+
+    monkeypatch.setattr("hermes_state.SessionDB", FakeSessionDB)
+    monkeypatch.setattr("cron.scheduler._deliver_result_with_receipt", deliver)
+
+    receipt = _deliver_outreach(
+        {"event_id": "deadline-1", "event_type": "idle_reconsideration"},
+        {
+            "action_id": "outreach-1",
+            "delivery_attempt_id": "attempt-1",
+            "subject_id": "user:local",
+            "content": "Hello from Soma.",
+        },
+        adapters={"feishu": object()},
+    )
+
+    assert receipt["status"] == "delivered"
+    assert captured[0][0]["origin"] == {
+        "platform": "feishu",
+        "chat_id": "feishu-chat",
+        "user_id": "feishu-user",
+        "chat_type": "dm",
+    }
+    assert captured[0][0]["metadata"]["route_source"] == "recent_verified_session"
+
+
+def test_typed_outreach_reports_no_verified_route_instead_of_skipped(monkeypatch):
+    class FakeSessionDB:
+        def list_gateway_sessions(self, *, active_only=True):
+            return [
+                {
+                    "source": "feishu",
+                    "chat_id": "group-chat",
+                    "user_id": "feishu-user",
+                    "chat_type": "group",
+                    "thread_id": None,
+                    "origin_json": None,
+                }
+            ]
+
+        def close(self):
+            return None
+
+    class Receipt:
+        def as_dict(self):
+            return {"status": "skipped", "targets": [], "error": None}
+
+    monkeypatch.setattr("hermes_state.SessionDB", FakeSessionDB)
+    monkeypatch.setattr(
+        "cron.scheduler._deliver_result_with_receipt",
+        lambda *_args, **_kwargs: Receipt(),
+    )
+
+    receipt = _deliver_outreach(
+        {"event_id": "deadline-1", "event_type": "idle_reconsideration"},
+        {
+            "action_id": "outreach-1",
+            "delivery_attempt_id": "attempt-1",
+            "subject_id": "user:local",
+            "content": "Hello from Soma.",
+        },
+        adapters={"feishu": object()},
+    )
+
+    assert receipt == {
+        "status": "failed",
+        "targets": [],
+        "error": "no_verified_route",
+    }
 
 
 def test_invalid_outreach_request_is_not_delivered(tmp_path, monkeypatch):
