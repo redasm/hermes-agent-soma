@@ -178,7 +178,9 @@ def test_install_ps1_migrates_only_desktop_managed_upstream_checkout(
     )
 
     assert result.returncode == 0, result.stderr
-    assert _git(managed, "config", "--get", "remote.origin.url").stdout.strip() == fork_url
+    assert (
+        _git(managed, "config", "--get", "remote.origin.url").stdout.strip() == fork_url
+    )
     _assert_conflict_was_recovered(managed, result.stdout)
 
 
@@ -233,9 +235,13 @@ def test_install_sh_repository_stage_clean_apply_drops_stash(
     )
 
     assert result.returncode == 0, result.stderr
-    assert "Local changes were restored on top of the updated codebase." in result.stdout
+    assert (
+        "Local changes were restored on top of the updated codebase." in result.stdout
+    )
     # Stash must be dropped on a clean apply — not preserved.
-    assert _git(managed, "stash", "list").stdout.strip() == "", "stash must be dropped on clean apply"
+    assert _git(managed, "stash", "list").stdout.strip() == "", (
+        "stash must be dropped on clean apply"
+    )
     # Local changes must be present in the working tree.
     assert (managed / "local-only.txt").read_text(encoding="utf-8") == "local edit\n"
     assert (managed / "tracked.txt").read_text(encoding="utf-8") == "upstream edit\n"
