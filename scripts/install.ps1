@@ -1467,8 +1467,20 @@ function Install-Repository {
                 # users hit on update. Pin autocrlf=false so the dirt is never
                 # created in the first place.
                 git -c windows.appendAtomically=false config core.autocrlf false 2>$null
-                git -c windows.appendAtomically=false remote set-url origin $RepoUrlHttps
-                if ($LASTEXITCODE -ne 0) { throw "git remote set-url failed (exit $LASTEXITCODE)" }
+                $originUrl = git -c windows.appendAtomically=false config --get remote.origin.url 2>$null | Select-Object -First 1
+                $managedInstallDir = [System.IO.Path]::GetFullPath((Join-Path $HermesHome "hermes-agent"))
+                $currentInstallDir = [System.IO.Path]::GetFullPath($InstallDir)
+                $isDesktopManagedInstall = [System.StringComparer]::OrdinalIgnoreCase.Equals(
+                    $currentInstallDir,
+                    $managedInstallDir
+                )
+                if ($isDesktopManagedInstall -and $originUrl -in @(
+                    "https://github.com/NousResearch/hermes-agent.git",
+                    "git@github.com:NousResearch/hermes-agent.git"
+                )) {
+                    git -c windows.appendAtomically=false remote set-url origin $RepoUrlHttps
+                    if ($LASTEXITCODE -ne 0) { throw "git remote set-url failed (exit $LASTEXITCODE)" }
+                }
                 Discard-LockfileChurn $InstallDir
                 # Preserve any real local changes before the checkout instead of
                 # discarding them with `reset --hard HEAD`. The old hard reset

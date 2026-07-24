@@ -138,6 +138,52 @@ def test_install_ps1_repository_stage_recovers_from_autostash_conflict(
 
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.skipif(
+    shutil.which("git") is None or POWERSHELL is None,
+    reason="needs git and PowerShell",
+)
+def test_install_ps1_migrates_only_desktop_managed_upstream_checkout(
+    tmp_path: Path,
+) -> None:
+    """The desktop-owned checkout follows the Soma fork without rebinding arbitrary repos."""
+    managed = _make_conflicted_managed_checkout(tmp_path)
+    local_origin = tmp_path / "origin.git"
+    upstream_url = "https://github.com/NousResearch/hermes-agent.git"
+    fork_url = "https://github.com/redasm/hermes-agent-soma.git"
+
+    # Preserve a real repository-stage execution without network access: Git
+    # records the public URL, while insteadOf routes both fetch targets to the
+    # local bare repository created by the fixture.
+    rewrite_key = f"url.{local_origin.as_uri()}.insteadOf"
+    _git(managed, "config", "--add", rewrite_key, upstream_url)
+    _git(managed, "config", "--add", rewrite_key, fork_url)
+    _git(managed, "remote", "set-url", "origin", upstream_url)
+
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-File",
+            str(INSTALL_PS1),
+            "-Stage",
+            "repository",
+            "-NonInteractive",
+            "-InstallDir",
+            str(managed),
+            "-HermesHome",
+            str(tmp_path),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _git(managed, "config", "--get", "remote.origin.url").stdout.strip() == fork_url
+    _assert_conflict_was_recovered(managed, result.stdout)
+
+
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.skipif(
     shutil.which("git") is None or shutil.which("bash") is None,
     reason="needs git and bash",
 )

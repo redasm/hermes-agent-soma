@@ -141,6 +141,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[name]"),
     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
                cli_only=True, aliases=("sb",)),
+    CommandDef("battery", "Toggle a color-coded battery indicator in the status bar",
+               "Configuration", cli_only=True, args_hint="[on|off|status]",
+               subcommands=("on", "off", "status")),
     CommandDef("timestamps", "Toggle [HH:MM] timestamps on messages and /history", "Configuration",
                cli_only=True, args_hint="[on|off|status]",
                subcommands=("on", "off", "status"), aliases=("ts",)),
@@ -156,8 +159,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[level|show|hide|full|clamp] [--global]",
                subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "show", "hide", "on", "off", "full", "clamp", "--global")),
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
-               args_hint="[normal|fast|status]",
-               subcommands=("normal", "fast", "status", "on", "off")),
+               args_hint="[normal|fast|status] [--global]",
+               subcommands=("normal", "fast", "status", "on", "off", "--global")),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
@@ -964,7 +967,8 @@ def discord_skill_commands_by_category(
 
     Skills whose directory is nested at least 2 levels under a scan root
     (e.g. ``creative/ascii-art/SKILL.md``) are grouped by their top-level
-    category.  Root-level skills (e.g. ``dogfood/SKILL.md``) are returned as
+    category.  Root-level skills (e.g. ``some-skill/SKILL.md`` directly under a
+    scan root) are returned as
     *uncategorized*.
 
     Scan roots include the local ``SKILLS_DIR`` **and** any configured
