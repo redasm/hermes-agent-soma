@@ -1702,6 +1702,7 @@ def init_agent(
         _agent_section = {}
     _interaction_mode = str(_agent_section.get("interaction_mode", "agent") or "agent").strip().lower()
     agent._interaction_mode = _interaction_mode if _interaction_mode in {"agent", "companion"} else "agent"
+    agent._session_init_model_config["interaction_mode"] = agent._interaction_mode
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
     # Intent-ack continuation config: "auto" (default — codex_responses only,

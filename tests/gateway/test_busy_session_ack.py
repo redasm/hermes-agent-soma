@@ -99,6 +99,66 @@ class TestBusySessionAck:
     """User sends a message while agent is running — should get acknowledgment."""
 
     @pytest.mark.asyncio
+    async def test_unknown_slash_command_is_rejected_before_busy_agent_interrupt(self):
+        """A mistyped command must never become an LLM follow-up while finalizing a turn."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter(platform_val="feishu")
+        event = _make_event(text="/sethone", platform_val="feishu")
+        event.message_type = MessageType.COMMAND
+        sk = build_session_key(event.source)
+
+        running_agent = MagicMock()
+        running_agent.get_activity_summary.return_value = {
+            "seconds_since_activity": 0.0,
+        }
+        runner._running_agents[sk] = running_agent
+        runner._running_agents_ts[sk] = time.time()
+        runner.adapters[event.source.platform] = adapter
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result is not None
+        assert "Unknown command" in result
+        assert "/sethone" in result
+        running_agent.interrupt.assert_not_called()
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_known_quick_command_is_deferred_before_busy_agent_interrupt(self):
+        """A valid quick command stays a command while the current turn is busy."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner.config.quick_commands = {
+            "companion-note": {"type": "prompt", "prompt": "remember this"}
+        }
+        adapter = _make_adapter(platform_val="feishu")
+        event = _make_event(text="/companion-note", platform_val="feishu")
+        event.message_type = MessageType.COMMAND
+        sk = build_session_key(event.source)
+
+        running_agent = MagicMock()
+        running_agent.get_activity_summary.return_value = {
+            "seconds_since_activity": 0.0,
+        }
+        runner._running_agents[sk] = running_agent
+        runner._running_agents_ts[sk] = time.time()
+        runner.adapters[event.source.platform] = adapter
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result is not None
+        assert "Agent is running" in result
+        assert "/companion-note" in result
+        assert "Unknown command" not in result
+        running_agent.interrupt.assert_not_called()
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
     async def test_handle_message_queue_mode_queues_without_interrupt(self):
         """Runner queue mode must not interrupt an active agent for text follow-ups."""
         from gateway.run import GatewayRunner

@@ -412,6 +412,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     """
     stored_prompt = None
     stored_state = "missing"
+    session_row = None
     if conversation_history and agent._session_db:
         try:
             session_row = agent._session_db.get_session(agent.session_id)
@@ -432,12 +433,26 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id, exc,
             )
 
-    if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
+    current_interaction_mode = _interaction_mode(agent)
+    stored_interaction_mode = _stored_interaction_mode(session_row)
+    interaction_mode_changed = (
+        session_row is not None and stored_interaction_mode != current_interaction_mode
+    )
+    if stored_prompt and interaction_mode_changed:
+        stored_state = "stale_interaction_mode"
+        logger.info(
+            "Stored system prompt for session %s has stale interaction mode "
+            "(%s -> %s); rebuilding.",
+            agent.session_id,
+            stored_interaction_mode,
+            current_interaction_mode,
+        )
+    elif stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt
         return
-    if stored_prompt:
+    elif stored_prompt:
         stored_state = "stale_runtime"
         logger.info(
             "Stored system prompt for session %s has stale runtime identity; "
@@ -498,6 +513,18 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     if agent._session_db:
         try:
             agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            if interaction_mode_changed:
+                model_config = _stored_model_config(session_row)
+                if not model_config:
+                    model_config = dict(
+                        getattr(agent, "_session_init_model_config", None) or {}
+                    )
+                model_config["interaction_mode"] = current_interaction_mode
+                agent._session_db.update_model_config(
+                    agent.session_id,
+                    json.dumps(model_config),
+                    model=agent.model,
+                )
         except Exception as exc:
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "
@@ -505,6 +532,32 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 "miss the prefix cache.",
                 agent.session_id, exc,
             )
+
+
+def _interaction_mode(agent) -> str:
+    value = str(getattr(agent, "_interaction_mode", "agent") or "agent").strip().lower()
+    return value if value in {"agent", "companion"} else "agent"
+
+
+def _stored_model_config(session_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not session_row:
+        return {}
+    raw = session_row.get("model_config")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _stored_interaction_mode(session_row: Optional[Dict[str, Any]]) -> str:
+    value = str(_stored_model_config(session_row).get("interaction_mode") or "agent")
+    value = value.strip().lower()
+    return value if value in {"agent", "companion"} else "agent"
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:

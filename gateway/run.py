@@ -2700,6 +2700,45 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     return None
 
 
+def _is_known_busy_slash_command(config: Any, command_name: str) -> bool:
+    """Return whether a non-built-in slash command is valid between turns."""
+    from hermes_cli.commands import is_gateway_known_command
+
+    if is_gateway_known_command(command_name):
+        return True
+
+    if isinstance(config, dict):
+        quick_commands = config.get("quick_commands", {}) or {}
+    else:
+        quick_commands = getattr(config, "quick_commands", {}) or {}
+    if isinstance(quick_commands, dict) and command_name in quick_commands:
+        return True
+
+    try:
+        from agent.skill_bundles import resolve_bundle_command_key
+
+        if resolve_bundle_command_key(command_name) is not None:
+            return True
+    except Exception:
+        pass
+
+    try:
+        from agent.skill_commands import resolve_skill_command_key
+
+        return resolve_skill_command_key(command_name) is not None
+    except Exception:
+        return False
+
+
+def _unknown_slash_command_notice(command_name: str) -> str:
+    return (
+        f"Unknown command `/{command_name}`. "
+        f"Type /commands to see what's available, "
+        f"or resend without the leading slash to send "
+        f"as a regular message."
+    )
+
+
 def _platform_config_key(platform: "Platform") -> str:
     """Map a Platform enum to its config.yaml key (LOCAL→"cli", rest→enum value)."""
     return "cli" if platform == Platform.LOCAL else platform.value
@@ -10982,6 +11021,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _denied is not None:
                     return _denied
 
+            # A slash command must remain control-plane input while an agent
+            # is busy. Never degrade a typo (or a valid plugin/skill/quick
+            # command) into ordinary LLM follow-up text.
+            if _evt_cmd and _cmd_def_inner is None:
+                if _is_known_busy_slash_command(self.config, _evt_cmd):
+                    return (
+                        f"Agent is running — `/{_evt_cmd}` can't run mid-turn. "
+                        f"Wait for the current response or `/stop` first."
+                    )
+                unavailable_skill = _check_unavailable_skill(_evt_cmd)
+                if unavailable_skill:
+                    return unavailable_skill
+                return _unknown_slash_command_notice(_evt_cmd)
+
             # Telegram sends /start for bot launches/deep-links. Treat it as a
             # platform ping, not a user command: no help dump, no agent
             # interrupt, no queued text.
@@ -12003,12 +12056,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             command,
                             source.platform.value if source.platform else "?",
                         )
-                        return (
-                            f"Unknown command `/{command}`. "
-                            f"Type /commands to see what's available, "
-                            f"or resend without the leading slash to send "
-                            f"as a regular message."
-                        )
+                        return _unknown_slash_command_notice(command)
             except Exception as e:
                 logger.debug("Skill command check failed (non-fatal): %s", e)
         

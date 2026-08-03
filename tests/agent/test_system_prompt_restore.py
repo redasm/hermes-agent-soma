@@ -15,6 +15,7 @@ instead of rebuilding).  Covers:
 
 from __future__ import annotations
 
+import json
 import logging
 from unittest.mock import MagicMock
 
@@ -31,6 +32,11 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     agent.model = "test-model"
     agent.provider = "openrouter"
     agent.platform = "cli"
+    agent._interaction_mode = "agent"
+    agent._session_init_model_config = {
+        "max_iterations": 60,
+        "interaction_mode": "agent",
+    }
     agent._session_db = session_db
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
@@ -67,6 +73,39 @@ class TestStoredPromptReuse:
 
         _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
         assert agent._cached_system_prompt == stored
+
+    def test_agent_prompt_rebuilds_when_runtime_switches_to_companion(self, caplog):
+        stored = "You are Hermes Agent.\n\nFinishing the job\n\nSkills (mandatory)"
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": stored,
+            "model_config": json.dumps(
+                {
+                    "max_iterations": 60,
+                    "interaction_mode": "agent",
+                }
+            ),
+        }
+        agent = _make_agent(session_db=db, prebuilt_prompt="COMPANION_PROMPT")
+        agent._interaction_mode = "companion"
+        agent._session_init_model_config["interaction_mode"] = "companion"
+
+        with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(
+                agent,
+                None,
+                [{"role": "user", "content": "hi"}],
+            )
+
+        assert agent._cached_system_prompt == "COMPANION_PROMPT"
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(agent.session_id, "COMPANION_PROMPT")
+        db.update_model_config.assert_called_once_with(
+            agent.session_id,
+            json.dumps(agent._session_init_model_config),
+            model=agent.model,
+        )
+        assert any("stale interaction mode" in record.getMessage() for record in caplog.records)
 
     def test_present_row_with_stale_runtime_identity_rebuilds(self, caplog):
         """Stored prompts are cache gold unless their runtime identity is stale.
