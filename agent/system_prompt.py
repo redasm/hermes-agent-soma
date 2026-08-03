@@ -166,6 +166,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
+    companion_mode = getattr(agent, "_interaction_mode", "agent") == "companion"
 
     # Resolve the model's context window once so context-file caps can scale
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
@@ -191,12 +192,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             stable_parts.append(_soul_content)
             _soul_loaded = True
 
-    if not _soul_loaded:
+    if not _soul_loaded and companion_mode:
+        stable_parts.append(
+            "You are a conversational companion. Respond naturally in the user's language, "
+            "with continuity, warmth, independent judgment, and honest boundaries."
+        )
+    elif not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    if not companion_mode:
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -204,7 +211,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # path is blocked) are not model-family specific.  Gated only by
     # config.yaml ``agent.task_completion_guidance`` (default True) so
     # users who want a leaner prompt can turn it off.
-    if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
+    if (
+        not companion_mode
+        and getattr(agent, "_task_completion_guidance", True)
+        and agent.valid_tool_names
+    ):
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
 
     # Universal parallel-tool-call guidance.  Tells the model to batch
@@ -215,25 +226,33 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # round-trips and the resent-context cost that compounds over a long
     # conversation.  Gated by config.yaml ``agent.parallel_tool_call_guidance``
     # (default True) and only injected when tools are actually loaded.
-    if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
+    if (
+        not companion_mode
+        and getattr(agent, "_parallel_tool_call_guidance", True)
+        and agent.valid_tool_names
+    ):
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
-    if "memory" in agent.valid_tool_names:
+    if not companion_mode and "memory" in agent.valid_tool_names:
         tool_guidance.append(MEMORY_GUIDANCE)
-    if "session_search" in agent.valid_tool_names:
+    if not companion_mode and "session_search" in agent.valid_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
-    if "skill_manage" in agent.valid_tool_names:
+    if not companion_mode and "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
     # this block. Resolved once at __init__ (see _kanban_worker_guidance).
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
-    if _kanban_guidance:
+    if not companion_mode and _kanban_guidance:
         tool_guidance.append(_kanban_guidance)
-    elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
+    elif (
+        not companion_mode
+        and _kanban_guidance is None
+        and "kanban_show" in agent.valid_tool_names
+    ):
         # Fallback for code paths that bypass agent_init (rare).
         tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
@@ -241,18 +260,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Steering only lands inside tool results, so it's only reachable when the
     # agent has tools. Static text → byte-stable prompt (no cache hit).
-    if agent.valid_tool_names:
+    if not companion_mode and agent.valid_tool_names:
         stable_parts.append(STEER_CHANNEL_NOTE)
 
     # Computer-use — goes in as its own block rather than being merged into
     # tool_guidance because the content is multi-paragraph. The guidance is
     # rendered for the host platform so Windows/Linux hosts don't see
     # macOS-only wording (Mac, Space, cmd+s).
-    if "computer_use" in agent.valid_tool_names:
+    if not companion_mode and "computer_use" in agent.valid_tool_names:
         from agent.prompt_builder import computer_use_guidance
         stable_parts.append(computer_use_guidance())
 
-    nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
+    nous_subscription_prompt = (
+        "" if companion_mode else _r.build_nous_subscription_prompt(agent.valid_tool_names)
+    )
     if nous_subscription_prompt:
         stable_parts.append(nous_subscription_prompt)
     # Tool-use enforcement: tells the model to actually call tools instead
@@ -262,7 +283,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     #   true  — always inject (all models)
     #   false — never inject
     #   list  — custom model-name substrings to match
-    if agent.valid_tool_names:
+    if not companion_mode and agent.valid_tool_names:
         _enforce = agent._tool_use_enforcement
         _inject = False
         if _enforce is True or (isinstance(_enforce, str) and _enforce.lower() in {"true", "always", "yes", "on"}):
@@ -291,7 +312,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-    has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+    has_skills_tools = not companion_mode and any(
+        name in agent.valid_tool_names for name in ["skills_list", "skill_view", "skill_manage"]
+    )
     if has_skills_tools:
         avail_toolsets = {
             toolset
@@ -328,7 +351,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # so the agent can correctly report which model it is (workaround for API bug).
     # Stable for the lifetime of an agent instance — model and provider are fixed
     # at construction time.
-    if agent.provider == "alibaba":
+    if not companion_mode and agent.provider == "alibaba":
         _model_short = agent.model.split("/")[-1] if "/" in agent.model else agent.model
         stable_parts.append(
             f"You are powered by the model named {_model_short}. "
@@ -340,7 +363,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
     # Stable for the lifetime of the process.
-    _env_hints = _r.build_environment_hints()
+    _env_hints = "" if companion_mode else _r.build_environment_hints()
     if _env_hints:
         stable_parts.append(_env_hints)
 
@@ -349,7 +372,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # git/workspace snapshot are built once here and cached for the session;
     # the snapshot is never re-probed per turn (that would break the prompt
     # cache), so the brief tells the model to re-check git before relying on it.
-    if agent.valid_tool_names:
+    if not companion_mode and agent.valid_tool_names:
         try:
             from agent.coding_context import coding_system_blocks
 
@@ -371,7 +394,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # entirely for remote terminal backends (the host's Python state is
     # irrelevant when tools run inside docker/modal/ssh).  Gated by
     # config.yaml ``agent.environment_probe`` (default True).
-    if getattr(agent, "_environment_probe", True):
+    if not companion_mode and getattr(agent, "_environment_probe", True):
         try:
             from tools.env_probe import get_environment_probe_line
             _probe_line = get_environment_probe_line()
@@ -388,32 +411,34 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # mid-session, so this doesn't break the prompt cache.
     # See file_safety._resolve_active_profile_name + classify_cross_profile_target
     # for the matching tool-side guard.
-    try:
-        from agent.file_safety import _resolve_active_profile_name
-        active_profile = _resolve_active_profile_name()
-    except Exception:
-        active_profile = "default"
-    if active_profile == "default":
-        stable_parts.append(
-            "Active Hermes profile: default. Other profiles (if any) live "
-            "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
-            "skills/, plugins/, cron/, and memories/ that affect a different "
-            "session than this one. Do not modify another profile's "
-            "skills/plugins/cron/memories unless the user explicitly directs "
-            "you to."
-        )
-    else:
-        stable_parts.append(
-            f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
-            f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
-            f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
-            f"different session run from a different shell. Do NOT modify "
-            f"another profile's skills/plugins/cron/memories unless the user "
-            f"explicitly directs you to. The cross-profile write guard will "
-            f"refuse such writes by default; pass cross_profile=True only "
-            f"after explicit direction."
-        )
+    if not companion_mode:
+        try:
+            from agent.file_safety import _resolve_active_profile_name
+
+            active_profile = _resolve_active_profile_name()
+        except Exception:
+            active_profile = "default"
+        if active_profile == "default":
+            stable_parts.append(
+                "Active Hermes profile: default. Other profiles (if any) live "
+                "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
+                "skills/, plugins/, cron/, and memories/ that affect a different "
+                "session than this one. Do not modify another profile's "
+                "skills/plugins/cron/memories unless the user explicitly directs "
+                "you to."
+            )
+        else:
+            stable_parts.append(
+                f"Active Hermes profile: {active_profile}. This session reads "
+                f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
+                f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
+                f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
+                f"different session run from a different shell. Do NOT modify "
+                f"another profile's skills/plugins/cron/memories unless the user "
+                f"explicitly directs you to. The cross-profile write guard will "
+                f"refuse such writes by default; pass cross_profile=True only "
+                f"after explicit direction."
+            )
 
     platform_key = (agent.platform or "").lower().strip()
     # Resolve the built-in/plugin default hint for this platform, then apply
@@ -459,7 +484,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if system_message is not None:
         context_parts.append(system_message)
 
-    if not agent.skip_context_files:
+    if not companion_mode and not agent.skip_context_files:
         # Prefer the configured TERMINAL_CWD (gateway mode). When unset (local
         # CLI), None lets build_context_files_prompt fall back to the launch
         # dir — the user's real cwd there, but the install dir for the gateway
@@ -509,11 +534,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # exact wall-clock time via tools when it actually needs it.
     # Credit: @iamfoz (PR #20451).
     timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
-    if agent.pass_session_id and agent.session_id:
+    if not companion_mode and agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
-    if agent.model:
+    if not companion_mode and agent.model:
         timestamp_line += f"\nModel: {agent.model}"
-    if agent.provider:
+    if not companion_mode and agent.provider:
         timestamp_line += f"\nProvider: {agent.provider}"
     volatile_parts.append(timestamp_line)
 

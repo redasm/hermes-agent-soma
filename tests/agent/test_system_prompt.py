@@ -70,6 +70,58 @@ def _stable_prompt(agent):
         return build_system_prompt_parts(agent)["stable"]
 
 
+def test_companion_mode_keeps_identity_and_omits_agent_operational_prompt():
+    agent = _make_agent(
+        load_soul_identity=True,
+        _interaction_mode="companion",
+        _task_completion_guidance=True,
+        _parallel_tool_call_guidance=True,
+        _tool_use_enforcement=True,
+        _environment_probe=True,
+        valid_tool_names=[
+            "web_search",
+            "skill_view",
+            "terminal",
+            "computer_use",
+            "session_search",
+            "memory",
+        ],
+        model="gpt-5.6-luna",
+        platform="feishu",
+    )
+
+    with (
+        patch("run_agent.load_soul_md", return_value="Soma identity"),
+        patch(
+            "run_agent.build_nous_subscription_prompt",
+            return_value="NOUS TOOL SUBSCRIPTION",
+        ),
+        patch("run_agent.build_environment_hints", return_value="RUNTIME ENVIRONMENT"),
+        patch("run_agent.build_context_files_prompt", return_value="PROJECT AGENT RULES"),
+        patch("run_agent.build_skills_system_prompt", return_value="MANDATORY SKILLS INDEX"),
+        patch("agent.system_prompt.get_hermes_home", return_value="/hermes-home"),
+    ):
+        parts = build_system_prompt_parts(agent, system_message="Companion safety boundary")
+
+    prompt = "\n".join(parts.values())
+    assert "Soma identity" in parts["stable"]
+    assert "Companion safety boundary" in parts["context"]
+    assert "Feishu" in parts["stable"]
+    for operational_text in (
+        "Finishing the job",
+        "Parallel tool calls",
+        "Tool-use enforcement",
+        "Execution discipline",
+        "NOUS TOOL SUBSCRIPTION",
+        "MANDATORY SKILLS INDEX",
+        "RUNTIME ENVIRONMENT",
+        "PROJECT AGENT RULES",
+        "Active Hermes profile",
+        "Computer Use",
+    ):
+        assert operational_text not in prompt
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""

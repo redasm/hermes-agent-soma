@@ -1685,7 +1685,6 @@ class TestTaskCompletionGuidance:
             )
             a.client = MagicMock()
             return a
-
     def test_default_injects_for_claude(self):
         """The block must reach Claude by default — that's the
         primary motivating model family."""
@@ -1742,6 +1741,35 @@ class TestTaskCompletionGuidance:
             )
             a.client = MagicMock()
             assert TASK_COMPLETION_GUIDANCE not in a._build_system_prompt()
+
+
+class TestInteractionMode:
+    def _make_agent(self, interaction_mode):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"interaction_mode": interaction_mode}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                enabled_toolsets=[],
+            )
+            agent.client = MagicMock()
+            return agent
+
+    def test_companion_mode_is_stable_session_configuration(self):
+        assert self._make_agent("companion")._interaction_mode == "companion"
+
+    def test_unknown_mode_falls_back_to_agent(self):
+        assert self._make_agent("roleplay")._interaction_mode == "agent"
 
 
 class TestEnvironmentProbeIntegration:

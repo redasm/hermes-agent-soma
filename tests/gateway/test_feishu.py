@@ -2199,6 +2199,58 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(event.reply_to_text, "父消息内容")
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_dm_reply_can_share_chat_session_without_losing_quote_metadata(self):
+        from gateway.config import PlatformConfig
+        from gateway.session import build_session_key
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        config = PlatformConfig(extra={"dm_top_level_threads_as_sessions": False})
+        adapter = FeishuAdapter(config)
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_chat", "name": "Feishu DM", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._fetch_message_text = AsyncMock(return_value="被引用的回答")
+        message = SimpleNamespace(
+            chat_id="oc_chat",
+            thread_id="omt_thread",
+            root_id="om_root",
+            parent_id="om_parent",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"纠正一下"}',
+            message_id="om_reply",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                is_bot=False,
+                chat_type="p2p",
+                message_id="om_reply",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertIsNone(event.source.thread_id)
+        self.assertEqual(event.reply_to_message_id, "om_parent")
+        self.assertEqual(event.reply_to_text, "被引用的回答")
+        top_level = adapter.build_source(
+            chat_id="oc_chat",
+            chat_name="Feishu DM",
+            chat_type="dm",
+            user_id="ou_user",
+            user_name="张三",
+            thread_id=None,
+        )
+        self.assertEqual(build_session_key(event.source), build_session_key(top_level))
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_replies_in_thread_when_thread_metadata_present(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
