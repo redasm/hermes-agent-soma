@@ -143,6 +143,12 @@ VALID_HOOKS: Set[str] = {
     "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
+    # Authenticated ordinary-conversation turn. The gateway supplies a clean
+    # user/assistant history projection and keeps transcript persistence and
+    # delivery ownership. A plugin may return ``{"action": "respond",
+    # "response": "..."}``; no result (or ``action=pass``) keeps the normal
+    # AIAgent path. Domain-specific dialogue semantics stay in the plugin.
+    "conversation_turn",
     # Generic host voice lifecycle events.  Payloads contain transport and
     # delivery metadata only; domain meaning belongs to consuming plugins.
     "voice_session_start",

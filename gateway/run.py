@@ -12693,6 +12693,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        _plain_user_message = str(event.text or "")
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
@@ -12861,6 +12862,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ride the current user message via the api_content sidecar instead
         # (staged below, consumed in run_sync → build_turn_context).
         turn_sidecar_notes: List[str] = []
+        from gateway.conversation_turn import interaction_mode as _interaction_mode
+
+        _turn_interaction_mode = _interaction_mode(_load_gateway_config())
+        _companion_ordinary_turn = (
+            _turn_interaction_mode == "companion"
+            and not getattr(event, "internal", False)
+            and not event.is_command()
+        )
 
         # If the previous session expired and was auto-reset, deliver a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -13557,7 +13566,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Delivered on the current user message (sidecar), NOT the ephemeral
         # system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed
         # system-prompt diff and agent rebuild.
-        if not history and not await self.async_session_store.has_any_sessions():
+        if (
+            not _companion_ordinary_turn
+            and not history
+            and not await self.async_session_store.has_any_sessions()
+        ):
             # Default first-contact note: a brief self-introduction.
             _intro_note = (
                 "[System note: This is the user's very first message ever. "
@@ -13596,7 +13609,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        if (
+            not _companion_ordinary_turn
+            and not history
+            and source.platform
+            and source.platform != Platform.LOCAL
+            and source.platform != Platform.WEBHOOK
+        ):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             # Multiplex: home channel may live only in the profile secret
@@ -13749,25 +13768,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
-            # Run the agent. Capture the session id that this run was launched
-            # against so post-run compression publication can be identity-guarded
-            # below; a /new or another lifecycle transition may move
+            # Run a plugin-owned ordinary conversation turn when one explicitly
+            # responds; otherwise preserve the existing AIAgent path. Capture
+            # the session id that this run was launched against so post-run
+            # compression publication can be identity-guarded; a /new or
+            # another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=_run_start_session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
-                moa_config=getattr(event, "_moa_config", None),
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-            )
+            conversation_result = None
+            if not getattr(event, "internal", False) and not event.is_command():
+                from gateway.conversation_turn import (
+                    handler_agent_result,
+                    invoke_conversation_turn,
+                    project_dialogue_history,
+                )
+
+                conversation_result = await invoke_conversation_turn(
+                    user_message=_plain_user_message,
+                    input_text=message_text,
+                    interaction_mode=_turn_interaction_mode,
+                    history=project_dialogue_history(history),
+                    quoted_message={
+                        "message_id": getattr(event, "reply_to_message_id", None),
+                        "text": getattr(event, "reply_to_text", None),
+                        "author_id": getattr(event, "reply_to_author_id", None),
+                        "author_name": getattr(event, "reply_to_author_name", None),
+                        "is_own_message": bool(
+                            getattr(event, "reply_to_is_own_message", False)
+                        ),
+                    },
+                    platform=source.platform.value if source.platform else "",
+                    user_id=source.user_id,
+                    user_name=source.user_name,
+                    chat_id=source.chat_id or "",
+                    chat_type=getattr(source, "chat_type", "") or "",
+                    thread_id=str(getattr(source, "thread_id", None) or ""),
+                    session_id=_run_start_session_id,
+                    session_key=session_key,
+                    message_id=str(getattr(event, "message_id", None) or ""),
+                    received_at=getattr(event, "timestamp", None),
+                )
+
+            if conversation_result is not None:
+                self._consume_pending_turn_sidecar_notes(session_key)
+                agent_result = handler_agent_result(
+                    conversation_result,
+                    history=history,
+                    user_message=_plain_user_message,
+                    session_id=_run_start_session_id,
+                )
+            else:
+                agent_result = await self._run_agent(
+                    message=message_text,
+                    context_prompt=context_prompt,
+                    history=history,
+                    source=source,
+                    session_id=_run_start_session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=self._reply_anchor_for_event(event),
+                    channel_prompt=event.channel_prompt,
+                    moa_config=getattr(event, "_moa_config", None),
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                )
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the

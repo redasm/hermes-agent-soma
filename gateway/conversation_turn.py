@@ -1,0 +1,101 @@
+"""Generic plugin handoff for authenticated ordinary conversation turns."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any, Iterable
+
+logger = logging.getLogger(__name__)
+
+
+def interaction_mode(config: Any) -> str:
+    """Return the host's normalized ordinary-turn mode."""
+
+    agent = config.get("agent") if isinstance(config, dict) else None
+    value = agent.get("interaction_mode") if isinstance(agent, dict) else None
+    normalized = str(value or "agent").strip().lower()
+    return normalized if normalized in {"agent", "companion"} else "agent"
+
+
+def project_dialogue_history(history: Iterable[dict[str, Any]]) -> list[dict[str, str]]:
+    """Return only persisted user/assistant text for a dialogue consumer."""
+
+    projected: list[dict[str, str]] = []
+    for message in history:
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        projected.append({"role": role, "content": content})
+    return projected
+
+
+async def invoke_conversation_turn(**payload: Any) -> dict[str, Any] | None:
+    """Return the first valid plugin-owned response, if one is offered."""
+
+    from hermes_cli.plugins import invoke_hook
+
+    results = await asyncio.to_thread(invoke_hook, "conversation_turn", **payload)
+    responses = [
+        result
+        for result in results
+        if isinstance(result, dict)
+        and result.get("action") == "respond"
+        and isinstance(result.get("response"), str)
+        and result["response"].strip()
+    ]
+    if len(responses) > 1:
+        logger.warning(
+            "Multiple conversation_turn handlers responded; using the first of %d",
+            len(responses),
+        )
+    return responses[0] if responses else None
+
+
+def handler_agent_result(
+    handler_result: dict[str, Any],
+    *,
+    history: list[dict[str, Any]],
+    user_message: str,
+    session_id: str,
+) -> dict[str, Any]:
+    """Adapt a bounded handler response to the gateway persistence contract."""
+
+    response = handler_result["response"].strip()
+    return {
+        "final_response": response,
+        "messages": [
+            *history,
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": response},
+        ],
+        "tools": [],
+        "history_offset": len(history),
+        "last_prompt_tokens": _non_negative_int(
+            handler_result.get("last_prompt_tokens")
+        ),
+        "api_calls": _non_negative_int(handler_result.get("api_calls")),
+        "model": _optional_string(handler_result.get("model")),
+        "context_length": _optional_positive_int(handler_result.get("context_length")),
+        "session_id": session_id,
+        "agent_persisted": False,
+        "failed": False,
+        "completed": True,
+    }
+
+
+def _non_negative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    parsed = _non_negative_int(value)
+    return parsed or None
+
+
+def _optional_string(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
