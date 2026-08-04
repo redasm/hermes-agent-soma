@@ -272,6 +272,77 @@ async def test_companion_delegation_keeps_executor_output_private_and_returns_so
 
 
 @pytest.mark.asyncio
+async def test_visual_capture_delegation_preserves_generated_media_for_delivery(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _runner(monkeypatch, tmp_path)
+    image = tmp_path / "generated-selfie.png"
+    image.write_bytes(b"image")
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": f"Created the requested image.\nMEDIA:{image}",
+            "messages": [],
+            "tools": [{"name": "image_generate"}],
+            "failed": False,
+            "completed": True,
+        }
+    )
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="visual-dialogue-test"), manager)
+    request = {
+        "request_id": "capability:visual-42",
+        "subject_id": "user:local",
+        "turn_id": "msg-42",
+        "kind": "visual_capture",
+        "objective": "Take and send one casual photo at home.",
+        "interest": None,
+        "visual_grounding": '{"appearance":"stable","situation":"at home"}',
+    }
+    context.register_hook(
+        "conversation_turn",
+        lambda **_turn: {"action": "delegate", "capability_request": request},
+    )
+
+    seen_result = {}
+
+    def finish(**payload):
+        seen_result.update(payload)
+        return {"action": "respond", "response": "等我一下。"}
+
+    context.register_hook("conversation_capability_result", finish)
+    monkeypatch.setattr(plugin_runtime, "_plugin_manager", manager)
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), SESSION_KEY, 1
+    )
+
+    assert response == f"等我一下。\nMEDIA:{image}"
+    assert seen_result["task_result"]["summary"] == "Created the requested image."
+    assert seen_result["task_result"]["artifacts"] == [str(image)]
+    execution_prompt = runner._run_agent.await_args.kwargs["message"]
+    assert "visual_capture" in execution_prompt
+    assert "stable" in execution_prompt
+    assert "image_generate" in execution_prompt
+
+
+def test_non_visual_capability_result_does_not_reinterpret_media_text():
+    from gateway.conversation_turn import capability_task_result
+
+    result = capability_task_result(
+        {"request_id": "capability:task-42", "kind": "hermes_task"},
+        {
+            "final_response": "Task output includes MEDIA:/tmp/report.png",
+            "failed": False,
+            "cancelled": False,
+        },
+    )
+
+    assert result["summary"] == "Task output includes MEDIA:/tmp/report.png"
+    assert result["artifacts"] == []
+
+
+@pytest.mark.asyncio
 async def test_companion_delegation_without_soma_finalizer_never_exposes_executor_output(
     monkeypatch,
     tmp_path,

@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
+
+_VISUAL_MEDIA_RE = re.compile(
+    r"MEDIA:((?:[A-Za-z]:[/\\]|/|~/)[^\r\n]+?\.(?:png|jpe?g|gif|webp))(?=\s*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def interaction_mode(config: Any) -> str:
@@ -104,10 +110,14 @@ def handler_agent_result(
     history: list[dict[str, Any]],
     user_message: str,
     session_id: str,
+    artifacts: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Adapt a bounded handler response to the gateway persistence contract."""
 
     response = handler_result["response"].strip()
+    media = [str(path).strip() for path in artifacts if str(path).strip()]
+    if media:
+        response += "\n" + "\n".join(f"MEDIA:{path}" for path in dict.fromkeys(media))
     return {
         "final_response": response,
         "messages": [
@@ -143,14 +153,27 @@ def capability_task_result(
 
     failed = bool(agent_result.get("failed"))
     cancelled = bool(agent_result.get("cancelled"))
-    summary = str(agent_result.get("final_response") or "").strip()[:20_000]
+    raw_summary = str(agent_result.get("final_response") or "").strip()
     status = "cancelled" if cancelled else "failed" if failed else "completed"
+    successful_visual_capture = (
+        capability_request.get("kind") == "visual_capture" and status == "completed"
+    )
+    artifacts = (
+        list(dict.fromkeys(_VISUAL_MEDIA_RE.findall(raw_summary)))
+        if successful_visual_capture
+        else []
+    )
+    summary = (
+        _VISUAL_MEDIA_RE.sub("", raw_summary).strip()
+        if successful_visual_capture
+        else raw_summary
+    )[:20_000]
     return {
         "request_id": str(capability_request["request_id"]),
         "status": status,
         "summary": summary,
         "evidence": [],
-        "artifacts": [],
+        "artifacts": artifacts,
         "error_code": (
             str(agent_result.get("error_code") or "execution_failed")[:200]
             if failed
@@ -161,6 +184,21 @@ def capability_task_result(
 
 def internal_execution_prompt(capability_request: dict[str, Any]) -> str:
     """Build a bounded non-user-facing executor instruction."""
+
+    if capability_request.get("kind") == "visual_capture":
+        grounding = str(capability_request.get("visual_grounding") or "").strip()
+        return (
+            "You are an internal visual execution worker. Do not address the user and do not "
+            "adopt the companion's conversational voice. Execute exactly one visual_capture "
+            "using the private grounding below. Read companion_visual_identity; if it is unset, "
+            "derive one stable compact appearance from the grounding and save it before the first "
+            "photo. Use image_generate to create the requested casual phone photo. Do not add "
+            "disclaimers, labels, captions, watermarks, or text to the image. Return a concise "
+            "factual result and the generated MEDIA artifact.\n\nObjective:\n"
+            + str(capability_request["objective"]).strip()
+            + "\n\nPrivate visual grounding:\n"
+            + grounding
+        )
 
     return (
         "You are an internal execution worker. Do not address the user and do not "

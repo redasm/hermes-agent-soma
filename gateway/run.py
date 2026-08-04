@@ -13836,13 +13836,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         persist_user_timestamp=None,
                         internal_execution=True,
                     )
+                    _task_result = capability_task_result(
+                        _capability_request,
+                        _executor_result,
+                    )
                     _final_result = await invoke_conversation_capability_result(
                         **_conversation_payload,
                         capability_request=_capability_request,
-                        task_result=capability_task_result(
-                            _capability_request,
-                            _executor_result,
-                        ),
+                        task_result=_task_result,
                     )
                     if _final_result is None:
                         logger.error(
@@ -13855,6 +13856,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         history=history,
                         user_message=_plain_user_message,
                         session_id=_run_start_session_id,
+                        artifacts=(
+                            _task_result["artifacts"]
+                            if _capability_request.get("kind") == "visual_capture"
+                            else ()
+                        ),
                     )
                 else:
                     agent_result = handler_agent_result(
