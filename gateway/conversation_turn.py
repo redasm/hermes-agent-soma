@@ -53,6 +53,14 @@ async def invoke_conversation_turn(**payload: Any) -> dict[str, Any] | None:
     return responses[0] if responses else None
 
 
+async def notify_conversation_turn_delivered(**payload: Any) -> None:
+    """Notify plugins after a plugin-owned ordinary reply was actually delivered."""
+
+    from hermes_cli.plugins import invoke_hook
+
+    await asyncio.to_thread(invoke_hook, "conversation_turn_delivered", **payload)
+
+
 def handler_agent_result(
     handler_result: dict[str, Any],
     *,
@@ -80,6 +88,11 @@ def handler_agent_result(
         "context_length": _optional_positive_int(handler_result.get("context_length")),
         "session_id": session_id,
         "agent_persisted": False,
+        "conversation_delivery_metadata": (
+            dict(handler_result["delivery_metadata"])
+            if isinstance(handler_result.get("delivery_metadata"), dict)
+            else None
+        ),
         "failed": False,
         "completed": True,
     }

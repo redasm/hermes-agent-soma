@@ -149,6 +149,10 @@ VALID_HOOKS: Set[str] = {
     # "response": "..."}``; no result (or ``action=pass``) keeps the normal
     # AIAgent path. Domain-specific dialogue semantics stay in the plugin.
     "conversation_turn",
+    # Successful delivery receipt for a plugin-owned ordinary turn. The host
+    # returns only the handler's opaque delivery_metadata plus session routing;
+    # domain lifecycle changes remain plugin-owned.
+    "conversation_turn_delivered",
     # Generic host voice lifecycle events.  Payloads contain transport and
     # delivery metadata only; domain meaning belongs to consuming plugins.
     "voice_session_start",

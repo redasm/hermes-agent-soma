@@ -14431,8 +14431,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
                             )
                     except Exception as _e:
-                        logger.debug("trailing footer send failed: %s", _e)
+                            logger.debug("trailing footer send failed: %s", _e)
                 return None
+
+            _conversation_delivery_metadata = agent_result.get(
+                "conversation_delivery_metadata"
+            )
+            if response and isinstance(_conversation_delivery_metadata, dict):
+                _delivery_adapter = self._adapter_for_source(source)
+                _register_receipt = getattr(
+                    _delivery_adapter,
+                    "register_delivery_receipt_callback",
+                    None,
+                )
+                if callable(_register_receipt):
+                    from gateway.conversation_turn import (
+                        notify_conversation_turn_delivered,
+                    )
+
+                    async def _notify_conversation_delivery(
+                        _metadata=dict(_conversation_delivery_metadata),
+                        _session_id=session_entry.session_id,
+                        _session_key=session_key,
+                    ):
+                        await notify_conversation_turn_delivered(
+                            delivery_metadata=_metadata,
+                            session_id=_session_id,
+                            session_key=_session_key,
+                        )
+
+                    _register_receipt(
+                        session_key,
+                        _notify_conversation_delivery,
+                        generation=run_generation,
+                    )
 
             return response
             

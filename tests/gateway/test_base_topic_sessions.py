@@ -157,6 +157,23 @@ class TestBasePlatformTopicSessions:
         ]
 
     @pytest.mark.asyncio
+    async def test_delivery_receipt_callback_fires_only_after_successful_send(self):
+        adapter = DummyTelegramAdapter()
+        delivered = []
+        event = _make_event("-1001", "17585")
+        session_key = build_session_key(event.source)
+        adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="ack"))
+        adapter.register_delivery_receipt_callback(
+            session_key,
+            lambda: delivered.append("delivered"),
+        )
+
+        await adapter._process_message_background(event, session_key)
+
+        assert delivered == ["delivered"]
+        assert adapter.pop_delivery_receipt_callback(session_key) is None
+
+    @pytest.mark.asyncio
     async def test_process_message_background_marks_total_send_failure_unsuccessful(self):
         adapter = DummyTelegramAdapter()
 
@@ -175,12 +192,20 @@ class TestBasePlatformTopicSessions:
         adapter._keep_typing = hold_typing
 
         event = _make_event("-1001", "17585")
-        await adapter._process_message_background(event, build_session_key(event.source))
+        session_key = build_session_key(event.source)
+        delivered = []
+        adapter.register_delivery_receipt_callback(
+            session_key,
+            lambda: delivered.append("delivered"),
+        )
+        await adapter._process_message_background(event, session_key)
 
         assert adapter.processing_hooks == [
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.FAILURE),
         ]
+        assert delivered == []
+        assert adapter.pop_delivery_receipt_callback(session_key) is None
 
     @pytest.mark.asyncio
     async def test_process_message_background_marks_exception_unsuccessful(self):

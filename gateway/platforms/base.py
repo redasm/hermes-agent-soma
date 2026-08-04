@@ -2512,6 +2512,10 @@ class BasePlatformAdapter(ABC):
         # deliveries generation-aware and avoid stale runs clearing callbacks
         # registered by a fresher run for the same session.
         self._post_delivery_callbacks: Dict[str, Any] = {}
+        # Success-only receipts for plugin-owned ordinary conversation turns.
+        # Unlike post-delivery callbacks, these are discarded when the main
+        # response is not accepted by the platform adapter.
+        self._delivery_receipt_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Optional authorization check, registered by GatewayRunner. Used by
@@ -4249,6 +4253,42 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks.pop(session_key, None)
         return entry if callable(entry) else None
 
+    def register_delivery_receipt_callback(
+        self,
+        session_key: str,
+        callback: Callable,
+        *,
+        generation: int | None = None,
+    ) -> None:
+        """Register one callback that fires only after successful main delivery."""
+        if not session_key or not callable(callback):
+            return
+        entry = (int(generation), callback) if generation is not None else callback
+        self._delivery_receipt_callbacks[session_key] = entry
+
+    def pop_delivery_receipt_callback(
+        self,
+        session_key: str,
+        *,
+        generation: int | None = None,
+    ) -> Callable | None:
+        """Pop a success-only receipt callback with optional generation ownership."""
+        if not session_key:
+            return None
+        entry = self._delivery_receipt_callbacks.get(session_key)
+        if entry is None:
+            return None
+        if isinstance(entry, tuple) and len(entry) == 2:
+            entry_generation, callback = entry
+            if generation is not None and int(entry_generation) != int(generation):
+                return None
+            self._delivery_receipt_callbacks.pop(session_key, None)
+            return callback if callable(callback) else None
+        if generation is not None:
+            return None
+        self._delivery_receipt_callbacks.pop(session_key, None)
+        return entry if callable(entry) else None
+
     # ── Processing lifecycle hooks ──────────────────────────────────────────
     # Subclasses override these to react to message processing events
     # (e.g. Discord adds 👀/✅/❌ reactions).
@@ -5492,6 +5532,29 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+
+            # A plugin-owned conversation may attach opaque lifecycle metadata.
+            # Consume its receipt callback for this run regardless of outcome,
+            # but invoke it only after a real platform send succeeded.
+            _receipt_generation = getattr(
+                interrupt_event,
+                "_hermes_run_generation",
+                None,
+            )
+            _receipt_cb = self.pop_delivery_receipt_callback(
+                session_key,
+                generation=_receipt_generation,
+            )
+            if delivery_attempted and delivery_succeeded and callable(_receipt_cb):
+                try:
+                    _receipt_result = _receipt_cb()
+                    if inspect.isawaitable(_receipt_result):
+                        await asyncio.wait_for(
+                            _receipt_result,
+                            timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
+                        )
+                except (asyncio.TimeoutError, Exception):
+                    logger.debug("Delivery receipt callback failed", exc_info=True)
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let

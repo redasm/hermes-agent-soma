@@ -166,6 +166,72 @@ async def test_plugin_conversation_response_bypasses_agent_and_persists_clean_tu
 
 
 @pytest.mark.asyncio
+async def test_plugin_conversation_delivery_metadata_waits_for_success_receipt(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock()
+
+    class Adapter:
+        def __init__(self):
+            self.callbacks = []
+
+        def register_delivery_receipt_callback(
+            self,
+            session_key,
+            callback,
+            *,
+            generation=None,
+        ):
+            self.callbacks.append((session_key, callback, generation))
+
+        async def stop_typing(self, _chat_id):
+            return None
+
+    adapter = Adapter()
+    runner._adapter_for_source = lambda _source: adapter
+    delivered = []
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="dialogue-test"), manager)
+    context.register_hook(
+        "conversation_turn",
+        lambda **_turn: {
+            "action": "respond",
+            "response": "I found one thing worth sharing.",
+            "delivery_metadata": {"owner": "dialogue-test", "token": "discovery-7"},
+        },
+    )
+    context.register_hook(
+        "conversation_turn_delivered",
+        lambda **receipt: delivered.append(receipt),
+    )
+    monkeypatch.setattr(plugin_runtime, "_plugin_manager", manager)
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), SESSION_KEY, 1
+    )
+
+    assert response == "I found one thing worth sharing."
+    assert delivered == []
+    assert len(adapter.callbacks) == 1
+    session_key, callback, generation = adapter.callbacks[0]
+    assert session_key == SESSION_KEY
+    assert generation == 1
+
+    await callback()
+
+    assert delivered == [
+        {
+            "delivery_metadata": {"owner": "dialogue-test", "token": "discovery-7"},
+            "session_id": "sess-companion",
+            "session_key": SESSION_KEY,
+            "telemetry_schema_version": "hermes.observer.v1",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_companion_first_turn_does_not_send_agent_home_channel_notice(
     monkeypatch,
     tmp_path,
