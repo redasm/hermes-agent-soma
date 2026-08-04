@@ -13777,13 +13777,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _run_start_session_id = session_entry.session_id
             conversation_result = None
             if not getattr(event, "internal", False) and not event.is_command():
-                from gateway.conversation_turn import (
-                    handler_agent_result,
-                    invoke_conversation_turn,
-                    project_dialogue_history,
-                )
+                from gateway.conversation_turn import invoke_conversation_turn, project_dialogue_history
 
-                conversation_result = await invoke_conversation_turn(
+                _conversation_payload = dict(
                     user_message=_plain_user_message,
                     input_text=message_text,
                     interaction_mode=_turn_interaction_mode,
@@ -13808,15 +13804,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_id=str(getattr(event, "message_id", None) or ""),
                     received_at=getattr(event, "timestamp", None),
                 )
+                conversation_result = await invoke_conversation_turn(
+                    **_conversation_payload
+                )
 
             if conversation_result is not None:
                 self._consume_pending_turn_sidecar_notes(session_key)
-                agent_result = handler_agent_result(
-                    conversation_result,
-                    history=history,
-                    user_message=_plain_user_message,
-                    session_id=_run_start_session_id,
+                from gateway.conversation_turn import handler_agent_result
+
+                if conversation_result.get("action") == "delegate":
+                    from gateway.conversation_turn import (
+                        capability_task_result,
+                        internal_execution_prompt,
+                        invoke_conversation_capability_result,
+                    )
+
+                    _capability_request = conversation_result["capability_request"]
+                    _capability_id = str(_capability_request["request_id"])
+                    _executor_result = await self._run_agent(
+                        message=internal_execution_prompt(_capability_request),
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id=f"{_run_start_session_id}:{_capability_id}",
+                        session_key=f"{session_key}:{_capability_id}",
+                        run_generation=run_generation,
+                        event_message_id=None,
+                        channel_prompt=None,
+                        moa_config=None,
+                        persist_user_message=None,
+                        persist_user_timestamp=None,
+                        internal_execution=True,
+                    )
+                    _final_result = await invoke_conversation_capability_result(
+                        **_conversation_payload,
+                        capability_request=_capability_request,
+                        task_result=capability_task_result(
+                            _capability_request,
+                            _executor_result,
+                        ),
+                    )
+                    if _final_result is None:
+                        logger.error(
+                            "Companion delegation had no plugin finalizer; "
+                            "refusing executor output"
+                        )
+                        return None
+                    agent_result = handler_agent_result(
+                        _final_result,
+                        history=history,
+                        user_message=_plain_user_message,
+                        session_id=_run_start_session_id,
+                    )
+                else:
+                    agent_result = handler_agent_result(
+                        conversation_result,
+                        history=history,
+                        user_message=_plain_user_message,
+                        session_id=_run_start_session_id,
+                    )
+            elif _turn_interaction_mode == "companion":
+                self._consume_pending_turn_sidecar_notes(session_key)
+                logger.error(
+                    "Companion turn had no plugin owner; refusing implicit agent fallback"
                 )
+                try:
+                    _owner_adapter = self._adapter_for_source(source)
+                    if _owner_adapter:
+                        await _owner_adapter.stop_typing(source.chat_id)
+                except Exception:
+                    pass
+                return None
             else:
                 agent_result = await self._run_agent(
                     message=message_text,
@@ -20029,6 +20087,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        internal_execution: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -20047,6 +20106,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                internal_execution=internal_execution,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -20058,6 +20118,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                internal_execution=internal_execution,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -20179,6 +20240,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        internal_execution: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -20269,6 +20331,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _env_tp and not _tool_progress_configured
             else (_resolved_tp or _env_tp or "all")
         )
+        if internal_execution:
+            progress_mode = "off"
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
@@ -20331,9 +20395,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _live_status_adapter = None
         if _live_status_mode == "off":
             _live_status_adapter = None
+        if internal_execution:
+            _live_status_adapter = None
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
-        log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
+        log_mode_enabled = (
+            not internal_execution
+            and progress_mode == "log"
+            and source.platform != Platform.WEBHOOK
+        )
         log_queue: "queue.Queue | None" = queue.Queue() if log_mode_enabled else None
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
@@ -20344,7 +20414,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         interim_assistant_messages_enabled = (
-            source.platform != Platform.WEBHOOK
+            not internal_execution
+            and source.platform != Platform.WEBHOOK
             and interim_assistant_messages_mode != "off"
         )
         # thinking_progress is independent — if enabled, we need the progress
@@ -20356,7 +20427,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=False,
             require_platform_override_for={Platform.MATTERMOST},
         )
-        _thinking_enabled = _thinking_mode != "off"
+        _thinking_enabled = not internal_execution and _thinking_mode != "off"
         needs_progress_queue = tool_progress_enabled or _thinking_enabled
 
 
@@ -21266,15 +21337,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Combine platform context, YAML channel_prompts hint for this chat,
             # channel_overrides system_prompt (or global ephemeral), and gateway
             # ephemeral prompt from _get_system_prompt_for_channel.
-            combined_ephemeral = context_prompt or ""
+            combined_ephemeral = "" if internal_execution else (context_prompt or "")
             event_channel_prompt = (channel_prompt or "").strip()
-            if event_channel_prompt:
+            if event_channel_prompt and not internal_execution:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
-            cfg_channel_prompt = self._get_system_prompt_for_channel(
-                source.platform,
-                source.chat_id or "",
-                thread_id=getattr(source, "thread_id", None),
-                parent_id=getattr(source, "parent_chat_id", None),
+            cfg_channel_prompt = (
+                ""
+                if internal_execution
+                else self._get_system_prompt_for_channel(
+                    source.platform,
+                    source.chat_id or "",
+                    thread_id=getattr(source, "thread_id", None),
+                    parent_id=getattr(source, "parent_chat_id", None),
+                )
             )
             if cfg_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
@@ -21324,7 +21399,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config, platform_key, "streaming"
             )
             # None = no per-platform override → follow global config
-            _streaming_enabled = (
+            _streaming_enabled = not internal_execution and (
                 _scfg.enabled and _scfg.transport != "off"
                 if _plat_streaming is None
                 else bool(_plat_streaming)
@@ -21698,21 +21773,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.tool_progress_callback = (
                 progress_callback
                 if (
+                    not internal_execution
+                    and (
                     needs_progress_queue
                     or log_mode_enabled
                     or _live_status_adapter is not None
+                    )
                 )
                 else None
             )
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
             agent.tool_start_callback = (
-                voice_ack_callback if _voice_ack_guild[0] is not None else None
+                voice_ack_callback
+                if not internal_execution and _voice_ack_guild[0] is not None
+                else None
             )
-            agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
-            agent.stream_delta_callback = _stream_delta_cb
-            agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
-            agent.status_callback = _status_callback_sync
+            agent.step_callback = (
+                _step_callback_sync
+                if not internal_execution and _hooks_ref.loaded_hooks
+                else None
+            )
+            agent.stream_delta_callback = None if internal_execution else _stream_delta_cb
+            agent.interim_assistant_callback = (
+                _interim_assistant_cb
+                if not internal_execution and _want_interim_messages
+                else None
+            )
+            agent.status_callback = None if internal_execution else _status_callback_sync
+            agent._execution_owner = "hermes"
+            agent._execution_purpose = (
+                "tool_execution" if internal_execution else "agent_dialogue"
+            )
             # Credits / out-of-band notices (usage bands, depletion, restored).
             # Messaging has no persistent status bar, so each notice is a
             # standalone push: render to a single plaintext line and deliver via

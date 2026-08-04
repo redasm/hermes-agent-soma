@@ -166,6 +166,155 @@ async def test_plugin_conversation_response_bypasses_agent_and_persists_clean_tu
 
 
 @pytest.mark.asyncio
+async def test_companion_mode_without_an_owner_never_falls_back_to_agent(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Hermes agent response must stay private.",
+            "messages": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+    monkeypatch.setattr(plugin_runtime, "_plugin_manager", PluginManager())
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), SESSION_KEY, 1
+    )
+
+    assert response is None
+    runner._run_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_companion_delegation_keeps_executor_output_private_and_returns_soma_reply(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "RAW HERMES EXECUTOR OUTPUT",
+            "messages": [
+                {"role": "assistant", "content": "RAW HERMES EXECUTOR OUTPUT"}
+            ],
+            "tools": [{"name": "terminal"}],
+            "history_offset": 0,
+            "last_prompt_tokens": 23,
+            "api_calls": 2,
+            "model": "executor-model",
+            "failed": False,
+            "completed": True,
+        }
+    )
+
+    seen_result = {}
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="dialogue-test"), manager)
+    request = {
+        "request_id": "capability:req-42",
+        "subject_id": "user:local",
+        "turn_id": "msg-42",
+        "kind": "hermes_task",
+        "objective": "Run the repository tests.",
+        "interest": None,
+    }
+    context.register_hook(
+        "conversation_turn",
+        lambda **_turn: {
+            "action": "delegate",
+            "capability_request": request,
+        },
+    )
+
+    def finish(**payload):
+        seen_result.update(payload)
+        return {
+            "action": "respond",
+            "response": "测试跑完了，有一处路由测试失败。",
+        }
+
+    context.register_hook("conversation_capability_result", finish)
+    monkeypatch.setattr(plugin_runtime, "_plugin_manager", manager)
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), SESSION_KEY, 1
+    )
+
+    assert response == "测试跑完了，有一处路由测试失败。"
+    execution = runner._run_agent.await_args.kwargs
+    assert execution["internal_execution"] is True
+    assert execution["history"] == []
+    assert execution["session_id"].endswith(":capability:req-42")
+    assert execution["session_key"].endswith(":capability:req-42")
+    assert "Run the repository tests." in execution["message"]
+    assert seen_result["capability_request"] == request
+    assert seen_result["task_result"] == {
+        "request_id": "capability:req-42",
+        "status": "completed",
+        "summary": "RAW HERMES EXECUTOR OUTPUT",
+        "evidence": [],
+        "artifacts": [],
+        "error_code": None,
+    }
+
+    appended = [
+        call.args[1]
+        for call in runner.session_store.append_to_transcript.call_args_list
+    ]
+    assert [message["role"] for message in appended] == ["user", "assistant"]
+    assert appended[-1]["content"] == "测试跑完了，有一处路由测试失败。"
+    assert all("RAW HERMES" not in str(message) for message in appended)
+    assert all("terminal" not in str(message) for message in appended)
+
+
+@pytest.mark.asyncio
+async def test_companion_delegation_without_soma_finalizer_never_exposes_executor_output(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "RAW PRIVATE RESULT",
+            "messages": [],
+            "failed": False,
+            "completed": True,
+        }
+    )
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="dialogue-test"), manager)
+    context.register_hook(
+        "conversation_turn",
+        lambda **_turn: {
+            "action": "delegate",
+            "capability_request": {
+                "request_id": "capability:no-finalizer",
+                "subject_id": "user:local",
+                "turn_id": "msg-42",
+                "kind": "hermes_task",
+                "objective": "Inspect the repository.",
+                "interest": None,
+            },
+        },
+    )
+    monkeypatch.setattr(plugin_runtime, "_plugin_manager", manager)
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), SESSION_KEY, 1
+    )
+
+    assert response is None
+    assert all(
+        "RAW PRIVATE RESULT" not in str(call)
+        for call in runner.session_store.append_to_transcript.call_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_plugin_conversation_delivery_metadata_waits_for_success_receipt(
     monkeypatch,
     tmp_path,

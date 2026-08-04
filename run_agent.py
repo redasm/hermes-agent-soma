@@ -6692,6 +6692,12 @@ class AIAgent:
                             model=self.model,
                             platform=platform,
                             process_id=os.getpid(),
+                            execution_owner=getattr(self, "_execution_owner", "hermes"),
+                            execution_purpose=getattr(
+                                self,
+                                "_execution_purpose",
+                                "agent_dialogue",
+                            ),
                         )
                     except Exception as exc:
                         logger.warning("post_llm_call hook failed: %s", exc)

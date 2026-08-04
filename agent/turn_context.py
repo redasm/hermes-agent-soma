@@ -1042,6 +1042,8 @@ def build_turn_context(
             sender_id=getattr(agent, "_user_id", None) or "",
             subject_id="user:local",
             turn_origin=turn_origin,
+            execution_owner=getattr(agent, "_execution_owner", "hermes"),
+            execution_purpose=getattr(agent, "_execution_purpose", "agent_dialogue"),
         )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin

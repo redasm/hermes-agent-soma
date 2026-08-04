@@ -32,11 +32,47 @@ def project_dialogue_history(history: Iterable[dict[str, Any]]) -> list[dict[str
 
 
 async def invoke_conversation_turn(**payload: Any) -> dict[str, Any] | None:
-    """Return the first valid plugin-owned response, if one is offered."""
+    """Return the first valid plugin-owned response or delegation request."""
 
     from hermes_cli.plugins import invoke_hook
 
     results = await asyncio.to_thread(invoke_hook, "conversation_turn", **payload)
+    responses = [
+        result
+        for result in results
+        if isinstance(result, dict)
+        and (
+            (
+                result.get("action") == "respond"
+                and isinstance(result.get("response"), str)
+                and result["response"].strip()
+            )
+            or (
+                result.get("action") == "delegate"
+                and _valid_capability_request(result.get("capability_request"))
+            )
+        )
+    ]
+    if len(responses) > 1:
+        logger.warning(
+            "Multiple conversation_turn handlers responded; using the first of %d",
+            len(responses),
+        )
+    return responses[0] if responses else None
+
+
+async def invoke_conversation_capability_result(
+    **payload: Any,
+) -> dict[str, Any] | None:
+    """Return the first valid plugin-authored final response to a task result."""
+
+    from hermes_cli.plugins import invoke_hook
+
+    results = await asyncio.to_thread(
+        invoke_hook,
+        "conversation_capability_result",
+        **payload,
+    )
     responses = [
         result
         for result in results
@@ -47,7 +83,8 @@ async def invoke_conversation_turn(**payload: Any) -> dict[str, Any] | None:
     ]
     if len(responses) > 1:
         logger.warning(
-            "Multiple conversation_turn handlers responded; using the first of %d",
+            "Multiple conversation_capability_result handlers responded; "
+            "using the first of %d",
             len(responses),
         )
     return responses[0] if responses else None
@@ -96,6 +133,51 @@ def handler_agent_result(
         "failed": False,
         "completed": True,
     }
+
+
+def capability_task_result(
+    capability_request: dict[str, Any],
+    agent_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Project an internal executor result into the bounded host contract."""
+
+    failed = bool(agent_result.get("failed"))
+    cancelled = bool(agent_result.get("cancelled"))
+    summary = str(agent_result.get("final_response") or "").strip()[:20_000]
+    status = "cancelled" if cancelled else "failed" if failed else "completed"
+    return {
+        "request_id": str(capability_request["request_id"]),
+        "status": status,
+        "summary": summary,
+        "evidence": [],
+        "artifacts": [],
+        "error_code": (
+            str(agent_result.get("error_code") or "execution_failed")[:200]
+            if failed
+            else None
+        ),
+    }
+
+
+def internal_execution_prompt(capability_request: dict[str, Any]) -> str:
+    """Build a bounded non-user-facing executor instruction."""
+
+    return (
+        "You are an internal execution worker. Do not address the user and do not "
+        "adopt a companion persona. Execute only the bounded objective below using "
+        "authorized tools. Return concise factual results, evidence, artifacts, and "
+        "errors for Soma to interpret.\n\nObjective:\n"
+        + str(capability_request["objective"]).strip()
+    )
+
+
+def _valid_capability_request(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return all(
+        isinstance(value.get(field), str) and value[field].strip()
+        for field in ("request_id", "kind", "objective")
+    )
 
 
 def _non_negative_int(value: Any) -> int:
