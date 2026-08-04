@@ -80,6 +80,24 @@ class TestAvailability:
         monkeypatch.setenv("OPENAI_API_KEY", "test")
         assert openai_plugin.OpenAIImageGenProvider().is_available() is True
 
+    def test_configured_key_env_is_available(self, tmp_path, monkeypatch):
+        import yaml
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("CUSTOM_IMAGE_KEY", "custom-test-key")
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "image_gen": {
+                        "provider": "openai",
+                        "key_env": "CUSTOM_IMAGE_KEY",
+                    }
+                }
+            )
+        )
+
+        assert openai_plugin.OpenAIImageGenProvider().is_available() is True
+
 
 # ── Model resolution ────────────────────────────────────────────────────────
 
@@ -197,6 +215,38 @@ class TestGenerate:
         result = openai_plugin.OpenAIImageGenProvider().generate("a cat")
         assert result["success"] is False
         assert result["error_type"] == "auth_required"
+
+    def test_custom_endpoint_uses_configured_client(self, tmp_path, monkeypatch):
+        import yaml
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("CUSTOM_IMAGE_KEY", "custom-test-key")
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "image_gen": {
+                        "provider": "openai",
+                        "base_url": "https://images.example.test/v1",
+                        "key_env": "CUSTOM_IMAGE_KEY",
+                        "model": "gpt-image-2",
+                    }
+                }
+            )
+        )
+        fake_client = MagicMock()
+        fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
+        fake_openai = MagicMock()
+        fake_openai.OpenAI.return_value = fake_client
+
+        with patch.dict("sys.modules", {"openai": fake_openai}):
+            result = openai_plugin.OpenAIImageGenProvider().generate("a cat")
+
+        assert result["success"] is True
+        fake_openai.OpenAI.assert_called_once_with(
+            api_key="custom-test-key",
+            base_url="https://images.example.test/v1",
+        )
+        assert fake_client.images.generate.call_args.kwargs["model"] == "gpt-image-2"
 
     def test_b64_saves_to_cache(self, provider, tmp_path):
         png_bytes = bytes.fromhex(_PNG_HEX)

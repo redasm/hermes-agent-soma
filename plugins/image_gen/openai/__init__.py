@@ -118,6 +118,22 @@ def _resolve_model() -> Tuple[str, Dict[str, Any]]:
     return DEFAULT_MODEL, _MODELS[DEFAULT_MODEL]
 
 
+def _resolve_client_config() -> Dict[str, str]:
+    """Resolve credentials and endpoint for OpenAI-compatible deployments."""
+    cfg = _load_openai_config()
+    key_env = cfg.get("key_env")
+    api_key = cfg.get("api_key") if isinstance(cfg.get("api_key"), str) else None
+    if not api_key and isinstance(key_env, str) and key_env.strip():
+        api_key = os.environ.get(key_env.strip())
+    if not api_key:
+        api_key = os.environ.get("OPENAI_API_KEY")
+    result = {"api_key": (api_key or "").strip()}
+    base_url = cfg.get("base_url")
+    if isinstance(base_url, str) and base_url.strip():
+        result["base_url"] = base_url.strip()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Source-image loading (for image-to-image / edit)
 # ---------------------------------------------------------------------------
@@ -173,7 +189,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
         return "OpenAI"
 
     def is_available(self) -> bool:
-        if not os.environ.get("OPENAI_API_KEY"):
+        if not _resolve_client_config().get("api_key"):
             return False
         try:
             import openai  # noqa: F401
@@ -235,12 +251,12 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        if not os.environ.get("OPENAI_API_KEY"):
+        client_config = _resolve_client_config()
+        if not client_config.get("api_key"):
             return error_response(
                 error=(
-                    "OPENAI_API_KEY not set. Run `hermes tools` → Image "
-                    "Generation → OpenAI to configure, or `hermes setup` "
-                    "to add the key."
+                    "An image provider API key is not configured. Set image_gen.api_key, "
+                    "image_gen.key_env, or OPENAI_API_KEY via `hermes tools`."
                 ),
                 error_type="auth_required",
                 provider="openai",
@@ -270,7 +286,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
         is_edit = bool(sources)
         modality = "image" if is_edit else "text"
 
-        client = openai.OpenAI()
+        client = openai.OpenAI(**client_config)
 
         if is_edit:
             # images.edit() expects file-like objects. Download/read each
@@ -316,8 +332,16 @@ class OpenAIImageGenProvider(ImageGenProvider):
         else:
             # gpt-image-2 returns b64_json unconditionally and REJECTS
             # ``response_format`` as an unknown parameter. Don't send it.
+            configured_model = _load_openai_config().get("model")
+            api_model = (
+                configured_model.strip()
+                if isinstance(configured_model, str)
+                and configured_model.strip()
+                and configured_model not in _MODELS
+                else API_MODEL
+            )
             payload: Dict[str, Any] = {
-                "model": API_MODEL,
+                "model": api_model,
                 "prompt": prompt,
                 "size": size,
                 "n": 1,
