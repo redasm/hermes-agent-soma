@@ -1,5 +1,6 @@
 """Gateway contract for plugin-owned ordinary conversation turns."""
 
+import json
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -276,17 +277,24 @@ async def test_visual_capture_delegation_preserves_generated_media_for_delivery(
     monkeypatch,
     tmp_path,
 ):
+    from gateway import conversation_turn
+
     runner = _runner(monkeypatch, tmp_path)
     image = tmp_path / "generated-selfie.png"
     image.write_bytes(b"image")
-    runner._run_agent = AsyncMock(
+    runner._run_agent = AsyncMock()
+    execute_visual_capture = AsyncMock(
         return_value={
-            "final_response": f"Created the requested image.\nMEDIA:{image}",
-            "messages": [],
-            "tools": [{"name": "image_generate"}],
-            "failed": False,
-            "completed": True,
+            "request_id": "capability:visual-42",
+            "status": "completed",
+            "summary": "Created the requested image.",
+            "evidence": [],
+            "artifacts": [str(image)],
+            "error_code": None,
         }
+    )
+    monkeypatch.setattr(
+        conversation_turn, "execute_visual_capture", execute_visual_capture
     )
     manager = PluginManager()
     context = PluginContext(PluginManifest(name="visual-dialogue-test"), manager)
@@ -320,10 +328,82 @@ async def test_visual_capture_delegation_preserves_generated_media_for_delivery(
     assert response == f"等我一下。\nMEDIA:{image}"
     assert seen_result["task_result"]["summary"] == "Created the requested image."
     assert seen_result["task_result"]["artifacts"] == [str(image)]
-    execution_prompt = runner._run_agent.await_args.kwargs["message"]
-    assert "visual_capture" in execution_prompt
-    assert "stable" in execution_prompt
-    assert "image_generate" in execution_prompt
+    runner._run_agent.assert_not_awaited()
+    execute_visual_capture.assert_awaited_once_with(request)
+
+
+@pytest.mark.asyncio
+async def test_visual_capture_executor_dispatches_image_generate_once(tmp_path):
+    from gateway.conversation_turn import execute_visual_capture
+
+    image = tmp_path / "generated-selfie.png"
+    image.write_bytes(b"image")
+    calls = []
+
+    def dispatch(name, args, **kwargs):
+        calls.append((name, args, kwargs))
+        return json.dumps({"success": True, "image": str(image)})
+
+    request = {
+        "request_id": "capability:visual-42",
+        "kind": "visual_capture",
+        "objective": "Take and send one casual phone photo at home.",
+        "visual_grounding": '{"appearance":"stable","situation":"at home"}',
+    }
+
+    result = await execute_visual_capture(request, dispatch_tool=dispatch)
+
+    assert result == {
+        "request_id": "capability:visual-42",
+        "status": "completed",
+        "summary": "Created the requested image.",
+        "evidence": [],
+        "artifacts": [str(image)],
+        "error_code": None,
+    }
+    assert len(calls) == 1
+    assert calls[0][0] == "image_generate"
+    assert calls[0][2] == {"task_id": "capability:visual-42"}
+    assert "Take and send one casual phone photo at home." in calls[0][1]["prompt"]
+    assert "stable" in calls[0][1]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_visual_capture_executor_discovers_image_tool_before_dispatch(
+    monkeypatch,
+    tmp_path,
+):
+    from gateway.conversation_turn import execute_visual_capture
+    from tools import registry as tool_registry
+
+    image = tmp_path / "generated-selfie.png"
+    image.write_bytes(b"image")
+    discover = MagicMock()
+    dispatch = MagicMock(
+        return_value=json.dumps({"success": True, "image": str(image)})
+    )
+    monkeypatch.setattr(tool_registry.registry, "get_entry", lambda _name: None)
+    monkeypatch.setattr(tool_registry, "discover_builtin_tools", discover)
+    monkeypatch.setattr(
+        tool_registry.registry,
+        "get_definitions",
+        lambda _names, quiet: [{"type": "function"}],
+    )
+    monkeypatch.setattr(tool_registry.registry, "dispatch", dispatch)
+
+    result = await execute_visual_capture(
+        {
+            "request_id": "capability:visual-discovery",
+            "kind": "visual_capture",
+            "objective": "Take one casual phone photo.",
+            "visual_grounding": '{"appearance":"stable"}',
+        }
+    )
+
+    discover.assert_called_once_with()
+    dispatch.assert_called_once()
+    assert result["status"] == "completed"
+    assert result["artifacts"] == [str(image)]
 
 
 def test_non_visual_capability_result_does_not_reinterpret_media_text():
@@ -340,6 +420,28 @@ def test_non_visual_capability_result_does_not_reinterpret_media_text():
 
     assert result["summary"] == "Task output includes MEDIA:/tmp/report.png"
     assert result["artifacts"] == []
+
+
+def test_visual_capability_result_without_media_is_failed():
+    from gateway.conversation_turn import capability_task_result
+
+    result = capability_task_result(
+        {"request_id": "capability:visual-42", "kind": "visual_capture"},
+        {
+            "final_response": "The worker did not create an image.",
+            "failed": False,
+            "cancelled": False,
+        },
+    )
+
+    assert result == {
+        "request_id": "capability:visual-42",
+        "status": "failed",
+        "summary": "The worker did not create an image.",
+        "evidence": [],
+        "artifacts": [],
+        "error_code": "visual_artifact_missing",
+    }
 
 
 @pytest.mark.asyncio

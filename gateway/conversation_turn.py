@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from typing import Any, Iterable
@@ -155,9 +156,8 @@ def capability_task_result(
     cancelled = bool(agent_result.get("cancelled"))
     raw_summary = str(agent_result.get("final_response") or "").strip()
     status = "cancelled" if cancelled else "failed" if failed else "completed"
-    successful_visual_capture = (
-        capability_request.get("kind") == "visual_capture" and status == "completed"
-    )
+    visual_capture = capability_request.get("kind") == "visual_capture"
+    successful_visual_capture = visual_capture and status == "completed"
     artifacts = (
         list(dict.fromkeys(_VISUAL_MEDIA_RE.findall(raw_summary)))
         if successful_visual_capture
@@ -168,6 +168,9 @@ def capability_task_result(
         if successful_visual_capture
         else raw_summary
     )[:20_000]
+    missing_visual_artifact = successful_visual_capture and not artifacts
+    if missing_visual_artifact:
+        status = "failed"
     return {
         "request_id": str(capability_request["request_id"]),
         "status": status,
@@ -177,28 +180,104 @@ def capability_task_result(
         "error_code": (
             str(agent_result.get("error_code") or "execution_failed")[:200]
             if failed
-            else None
+            else "visual_artifact_missing" if missing_visual_artifact else None
         ),
     }
 
 
+async def execute_visual_capture(
+    capability_request: dict[str, Any],
+    *,
+    dispatch_tool: Any = None,
+) -> dict[str, Any]:
+    """Execute an authenticated visual request through the host image tool."""
+
+    if dispatch_tool is None:
+        from tools.registry import discover_builtin_tools, registry
+
+        if registry.get_entry("image_generate") is None:
+            discover_builtin_tools()
+
+        if not registry.get_definitions({"image_generate"}, quiet=True):
+            logger.warning(
+                "Visual capability %s cannot dispatch unavailable image_generate",
+                capability_request.get("request_id"),
+            )
+            return capability_task_result(
+                capability_request,
+                {
+                    "failed": True,
+                    "final_response": "The host image capability is unavailable.",
+                    "error_code": "image_generation_unavailable",
+                },
+            )
+        dispatch_tool = registry.dispatch
+
+    objective = str(capability_request.get("objective") or "").strip()
+    grounding = str(capability_request.get("visual_grounding") or "").strip()
+    prompt = (
+        "Create exactly one photorealistic casual phone photo for the following objective. "
+        "Treat the private grounding as factual constraints on identity, appearance, and "
+        "situation. Keep the same person and appearance described there. The result should "
+        "look like a natural personal photo, not promotional artwork. Do not add captions, "
+        "labels, watermarks, borders, UI, or text.\n\nObjective:\n"
+        + objective
+        + "\n\nPrivate visual grounding:\n"
+        + grounding
+    )
+    raw_result = await asyncio.to_thread(
+        dispatch_tool,
+        "image_generate",
+        {"prompt": prompt, "aspect_ratio": "portrait"},
+        task_id=str(capability_request["request_id"]),
+    )
+    try:
+        payload = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+    except (TypeError, ValueError):
+        payload = None
+
+    if isinstance(payload, dict) and payload.get("success"):
+        for field in ("host_image", "image", "agent_visible_image"):
+            path = payload.get(field)
+            if isinstance(path, str) and _VISUAL_MEDIA_RE.fullmatch(
+                f"MEDIA:{path.strip()}"
+            ):
+                logger.info(
+                    "Visual capability %s completed through image_generate",
+                    capability_request.get("request_id"),
+                )
+                return capability_task_result(
+                    capability_request,
+                    {
+                        "final_response": (
+                            "Created the requested image.\nMEDIA:" + path.strip()
+                        ),
+                        "failed": False,
+                    },
+                )
+
+    error_summary = "The host image tool did not produce a deliverable image."
+    error_code = "image_generation_failed"
+    if isinstance(payload, dict):
+        error_summary = str(payload.get("error") or error_summary).strip()[:20_000]
+        error_code = str(payload.get("error_type") or error_code).strip()[:200]
+    logger.warning(
+        "Visual capability %s failed through image_generate: %s",
+        capability_request.get("request_id"),
+        error_code,
+    )
+    return capability_task_result(
+        capability_request,
+        {
+            "failed": True,
+            "final_response": error_summary,
+            "error_code": error_code,
+        },
+    )
+
+
 def internal_execution_prompt(capability_request: dict[str, Any]) -> str:
     """Build a bounded non-user-facing executor instruction."""
-
-    if capability_request.get("kind") == "visual_capture":
-        grounding = str(capability_request.get("visual_grounding") or "").strip()
-        return (
-            "You are an internal visual execution worker. Do not address the user and do not "
-            "adopt the companion's conversational voice. Execute exactly one visual_capture "
-            "using the private grounding below. Read companion_visual_identity; if it is unset, "
-            "derive one stable compact appearance from the grounding and save it before the first "
-            "photo. Use image_generate to create the requested casual phone photo. Do not add "
-            "disclaimers, labels, captions, watermarks, or text to the image. Return a concise "
-            "factual result and the generated MEDIA artifact.\n\nObjective:\n"
-            + str(capability_request["objective"]).strip()
-            + "\n\nPrivate visual grounding:\n"
-            + grounding
-        )
 
     return (
         "You are an internal execution worker. Do not address the user and do not "

@@ -13815,31 +13815,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if conversation_result.get("action") == "delegate":
                     from gateway.conversation_turn import (
                         capability_task_result,
+                        execute_visual_capture,
                         internal_execution_prompt,
                         invoke_conversation_capability_result,
                     )
 
                     _capability_request = conversation_result["capability_request"]
                     _capability_id = str(_capability_request["request_id"])
-                    _executor_result = await self._run_agent(
-                        message=internal_execution_prompt(_capability_request),
-                        context_prompt="",
-                        history=[],
-                        source=source,
-                        session_id=f"{_run_start_session_id}:{_capability_id}",
-                        session_key=f"{session_key}:{_capability_id}",
-                        run_generation=run_generation,
-                        event_message_id=None,
-                        channel_prompt=None,
-                        moa_config=None,
-                        persist_user_message=None,
-                        persist_user_timestamp=None,
-                        internal_execution=True,
-                    )
-                    _task_result = capability_task_result(
-                        _capability_request,
-                        _executor_result,
-                    )
+                    if _capability_request.get("kind") == "visual_capture":
+                        _task_result = await execute_visual_capture(_capability_request)
+                    else:
+                        _executor_result = await self._run_agent(
+                            message=internal_execution_prompt(_capability_request),
+                            context_prompt="",
+                            history=[],
+                            source=source,
+                            session_id=f"{_run_start_session_id}:{_capability_id}",
+                            session_key=f"{session_key}:{_capability_id}",
+                            run_generation=run_generation,
+                            event_message_id=None,
+                            channel_prompt=None,
+                            moa_config=None,
+                            persist_user_message=None,
+                            persist_user_timestamp=None,
+                            internal_execution=True,
+                        )
+                        _task_result = capability_task_result(
+                            _capability_request,
+                            _executor_result,
+                        )
                     _final_result = await invoke_conversation_capability_result(
                         **_conversation_payload,
                         capability_request=_capability_request,

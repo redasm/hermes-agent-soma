@@ -5674,6 +5674,25 @@ class TestBuildCallKwargsToolDedup:
         names = [t["function"]["name"] for t in kwargs["tools"]]
         assert names == ["alpha", "beta"]
 
+    def test_required_tool_choice_is_projected_with_tools(self):
+        tools = [
+            self._make_tool("respond_to_user"),
+            self._make_tool("request_host_task"),
+        ]
+        try:
+            kwargs = _build_call_kwargs(
+                provider="openai",
+                model="gpt-4o",
+                messages=[],
+                tools=tools,
+                tool_choice="required",
+            )
+        except TypeError as exc:
+            kwargs = exc
+
+        assert not isinstance(kwargs, TypeError), str(kwargs)
+        assert kwargs["tool_choice"] == "required"
+
     def test_duplicate_tool_names_are_deduplicated(self):
         """RED test — must fail until dedup guard is added."""
         tools = [

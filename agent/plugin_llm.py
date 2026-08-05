@@ -136,6 +136,15 @@ class PluginLlmCompleteResult:
     audit: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class PluginLlmToolCall:
+    """One provider-normalized native function call returned to a plugin."""
+
+    id: str
+    name: str
+    arguments: Dict[str, Any]
+
+
 @dataclass
 class PluginLlmStructuredResult:
     """Result of :meth:`PluginLlm.complete_structured`.
@@ -143,7 +152,9 @@ class PluginLlmStructuredResult:
     ``parsed`` is set only when ``json_mode=True`` or ``json_schema`` is
     provided AND the response was valid JSON. ``content_type`` is
     ``"json"`` in that case, ``"text"`` otherwise (e.g. the model
-    refused or the response wasn't requested as JSON)."""
+    refused or the response wasn't requested as JSON). ``tool_calls``
+    contains provider-normalized native function calls when tools were
+    supplied to the completion."""
 
     text: str
     provider: str
@@ -152,6 +163,7 @@ class PluginLlmStructuredResult:
     usage: PluginLlmUsage = field(default_factory=PluginLlmUsage)
     parsed: Optional[Any] = None
     content_type: str = "text"
+    tool_calls: tuple[PluginLlmToolCall, ...] = ()
     audit: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -379,6 +391,7 @@ def _build_structured_messages(
     json_schema: Optional[Any],
     schema_name: Optional[str],
     system_prompt: Optional[str],
+    tools_available: bool = False,
 ) -> List[Dict[str, Any]]:
     """Build the OpenAI-style messages list for a structured call.
 
@@ -392,8 +405,13 @@ def _build_structured_messages(
     if system_prompt:
         sys_parts.append(system_prompt.strip())
     if json_mode or json_schema is not None:
+        prefix = (
+            "If you do not call a provided tool, respond"
+            if tools_available
+            else "Respond"
+        )
         sys_parts.append(
-            "Respond with a single JSON object that matches the requested shape. "
+            f"{prefix} with a single JSON object that matches the requested shape. "
             "Do not include prose or markdown fences."
         )
     if sys_parts:
@@ -538,6 +556,36 @@ def _extract_text(response: Any) -> str:
     except (AttributeError, IndexError, TypeError):
         pass
     return ""
+
+
+def _extract_tool_calls(response: Any) -> tuple[PluginLlmToolCall, ...]:
+    """Pull validated native function calls from an OpenAI-shaped response."""
+    try:
+        raw_calls = response.choices[0].message.tool_calls or []
+    except (AttributeError, IndexError, TypeError):
+        return ()
+
+    calls: list[PluginLlmToolCall] = []
+    for raw_call in raw_calls:
+        function = getattr(raw_call, "function", None)
+        name = str(getattr(function, "name", "") or "").strip()
+        raw_arguments = getattr(function, "arguments", "")
+        if not name or not isinstance(raw_arguments, str):
+            raise ValueError("Plugin LLM returned an invalid native tool call")
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Plugin LLM tool arguments were not valid JSON") from exc
+        if not isinstance(arguments, dict):
+            raise ValueError("Plugin LLM tool arguments must be a JSON object")
+        calls.append(
+            PluginLlmToolCall(
+                id=str(getattr(raw_call, "id", "") or ""),
+                name=name,
+                arguments=arguments,
+            )
+        )
+    return tuple(calls)
 
 
 def _resolve_attribution(
@@ -689,6 +737,8 @@ class PluginLlm:
         json_mode: bool = False,
         schema_name: Optional[str] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
         provider: Optional[str] = None,
         model: Optional[str] = None,
         temperature: Optional[float] = None,
@@ -731,6 +781,7 @@ class PluginLlm:
             json_schema=json_schema,
             schema_name=schema_name,
             system_prompt=system_prompt,
+            tools_available=bool(tools),
         )
         extra_body = self._json_response_format(json_mode=json_mode, json_schema=json_schema)
 
@@ -743,9 +794,12 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=extra_body,
+            tools=tools,
+            tool_choice=tool_choice,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
+        tool_calls = _extract_tool_calls(response)
         parsed, content_type = _parse_structured_text(
             text=text, json_mode=json_mode, json_schema=json_schema
         )
@@ -757,6 +811,7 @@ class PluginLlm:
             usage=usage,
             parsed=parsed,
             content_type=content_type,
+            tool_calls=tool_calls,
             audit={
                 "plugin_id": self._plugin_id,
                 "purpose": purpose or "",
@@ -829,6 +884,8 @@ class PluginLlm:
         json_mode: bool = False,
         schema_name: Optional[str] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
         provider: Optional[str] = None,
         model: Optional[str] = None,
         temperature: Optional[float] = None,
@@ -859,6 +916,7 @@ class PluginLlm:
             json_schema=json_schema,
             schema_name=schema_name,
             system_prompt=system_prompt,
+            tools_available=bool(tools),
         )
         extra_body = self._json_response_format(json_mode=json_mode, json_schema=json_schema)
         real_provider, real_model, response = await self._invoke_async(
@@ -870,9 +928,12 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=extra_body,
+            tools=tools,
+            tool_choice=tool_choice,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
+        tool_calls = _extract_tool_calls(response)
         parsed, content_type = _parse_structured_text(
             text=text, json_mode=json_mode, json_schema=json_schema
         )
@@ -884,6 +945,7 @@ class PluginLlm:
             usage=usage,
             parsed=parsed,
             content_type=content_type,
+            tool_calls=tool_calls,
             audit={
                 "plugin_id": self._plugin_id,
                 "purpose": purpose or "",
@@ -927,12 +989,14 @@ class PluginLlm:
         max_tokens: Optional[int],
         timeout: Optional[float],
         extra_body: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
     ) -> tuple[str, str, Any]:
         """Invoke the host's ``call_llm``. Lazy-imports
         ``agent.auxiliary_client`` to avoid circular deps at plugin
         discovery time."""
         if self._sync_caller is not None:
-            return self._sync_caller(
+            caller_kwargs = dict(
                 messages=messages,
                 provider_override=provider_override,
                 model_override=model_override,
@@ -942,6 +1006,11 @@ class PluginLlm:
                 timeout=timeout,
                 extra_body=extra_body,
             )
+            if tools is not None:
+                caller_kwargs["tools"] = tools
+            if tool_choice is not None:
+                caller_kwargs["tool_choice"] = tool_choice
+            return self._sync_caller(**caller_kwargs)
         from agent.auxiliary_client import call_llm
         merged_extra = dict(extra_body or {})
         if profile_override:
@@ -954,6 +1023,8 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            tools=tools,
+            tool_choice=tool_choice,
             extra_body=merged_extra or None,
         )
         provider, model = _resolve_attribution(
@@ -974,9 +1045,11 @@ class PluginLlm:
         max_tokens: Optional[int],
         timeout: Optional[float],
         extra_body: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
     ) -> tuple[str, str, Any]:
         if self._async_caller is not None:
-            return await self._async_caller(
+            caller_kwargs = dict(
                 messages=messages,
                 provider_override=provider_override,
                 model_override=model_override,
@@ -986,6 +1059,11 @@ class PluginLlm:
                 timeout=timeout,
                 extra_body=extra_body,
             )
+            if tools is not None:
+                caller_kwargs["tools"] = tools
+            if tool_choice is not None:
+                caller_kwargs["tool_choice"] = tool_choice
+            return await self._async_caller(**caller_kwargs)
         from agent.auxiliary_client import async_call_llm
         merged_extra = dict(extra_body or {})
         if profile_override:
@@ -998,6 +1076,8 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            tools=tools,
+            tool_choice=tool_choice,
             extra_body=merged_extra or None,
         )
         provider, model = _resolve_attribution(
@@ -1041,6 +1121,7 @@ __all__ = [
     "PluginLlmUsage",
     "PluginLlmCompleteResult",
     "PluginLlmStructuredResult",
+    "PluginLlmToolCall",
     "PluginLlmTrustError",
     "make_plugin_llm_for_test",
 ]

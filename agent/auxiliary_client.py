@@ -3645,6 +3645,7 @@ def _retry_same_provider_sync(
     temperature: Optional[float],
     max_tokens: Optional[int],
     tools: Optional[list],
+    tool_choice: Optional[str],
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
@@ -3680,6 +3681,7 @@ def _retry_same_provider_sync(
         temperature=temperature,
         max_tokens=max_tokens,
         tools=tools,
+        tool_choice=tool_choice,
         timeout=effective_timeout,
         extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
@@ -3711,6 +3713,7 @@ async def _retry_same_provider_async(
     temperature: Optional[float],
     max_tokens: Optional[int],
     tools: Optional[list],
+    tool_choice: Optional[str],
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
@@ -3746,6 +3749,7 @@ async def _retry_same_provider_async(
         temperature=temperature,
         max_tokens=max_tokens,
         tools=tools,
+        tool_choice=tool_choice,
         timeout=effective_timeout,
         extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
@@ -3923,6 +3927,7 @@ def _call_fallback_candidate_sync(
     temperature: Optional[float],
     max_tokens: Optional[int],
     tools: Optional[list],
+    tool_choice: Optional[str],
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
@@ -3957,11 +3962,19 @@ def _call_fallback_candidate_sync(
         effective_timeout = fb_timeout
     fb_base = str(getattr(fb_client, "base_url", "") or "")
     fb_kwargs = _build_call_kwargs(
-        fb_label, fb_model, messages,
-        temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout,
-        extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=fb_base, task=task)
+        fb_label,
+        fb_model,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=tools,
+        tool_choice=tool_choice,
+        timeout=effective_timeout,
+        extra_body=effective_extra_body,
+        reasoning_config=reasoning_config,
+        base_url=fb_base,
+        task=task,
+    )
     try:
         return _validate_llm_response(
             fb_client.chat.completions.create(**fb_kwargs), task)
@@ -3973,9 +3986,14 @@ def _call_fallback_candidate_sync(
             retry_client, retry_model = _get_cached_client(fb_provider, fb_model)
             if retry_client is not None:
                 retry_kwargs = _build_call_kwargs(
-                    fb_provider, retry_model or fb_model, messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
+                    fb_provider,
+                    retry_model or fb_model,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base), task=task)
@@ -4008,6 +4026,7 @@ async def _call_fallback_candidate_async(
     temperature: Optional[float],
     max_tokens: Optional[int],
     tools: Optional[list],
+    tool_choice: Optional[str],
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
@@ -4023,11 +4042,19 @@ async def _call_fallback_candidate_async(
         effective_timeout = fb_timeout
     fb_base = str(getattr(fb_client, "base_url", "") or "")
     fb_kwargs = _build_call_kwargs(
-        fb_label, fb_model, messages,
-        temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout,
-        extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=fb_base, task=task)
+        fb_label,
+        fb_model,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=tools,
+        tool_choice=tool_choice,
+        timeout=effective_timeout,
+        extra_body=effective_extra_body,
+        reasoning_config=reasoning_config,
+        base_url=fb_base,
+        task=task,
+    )
     try:
         return _validate_llm_response(
             await fb_client.chat.completions.create(**fb_kwargs), task)
@@ -4040,9 +4067,14 @@ async def _call_fallback_candidate_async(
                 fb_provider, fb_model, async_mode=True)
             if retry_client is not None:
                 retry_kwargs = _build_call_kwargs(
-                    fb_provider, retry_model or fb_model, messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
+                    fb_provider,
+                    retry_model or fb_model,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base), task=task)
@@ -6803,6 +6835,7 @@ def _build_call_kwargs(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     tools: Optional[list] = None,
+    tool_choice: Optional[str] = None,
     timeout: float = 30.0,
     extra_body: Optional[dict] = None,
     reasoning_config: Optional[dict] = None,
@@ -6910,6 +6943,8 @@ def _build_call_kwargs(
                 _seen.add(_tname)
             _deduped.append(_t)
         kwargs["tools"] = _deduped
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
 
     # Build provider-aware reasoning kwargs through the same profile hooks used
     # by the standard chat-completions transport. Some providers require
@@ -7116,6 +7151,7 @@ def call_llm(
     temperature: Optional[float] = None,
     max_tokens: int = None,
     tools: list = None,
+    tool_choice: str = None,
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
@@ -7256,9 +7292,15 @@ def call_llm(
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     kwargs = _build_call_kwargs(
-        resolved_provider, final_model, messages,
-        temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
+        resolved_provider,
+        final_model,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=tools,
+        tool_choice=tool_choice,
+        timeout=effective_timeout,
+        extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
     if extra_headers:
@@ -7513,6 +7555,7 @@ def call_llm(
                     temperature=temperature,
                     max_tokens=max_tokens,
                     tools=tools,
+                    tool_choice=tool_choice,
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
@@ -7557,6 +7600,7 @@ def call_llm(
                         temperature=temperature,
                         max_tokens=max_tokens,
                         tools=tools,
+                        tool_choice=tool_choice,
                         effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
@@ -7678,10 +7722,16 @@ def call_llm(
 
             if fb_client is not None:
                 fb_resp = _call_fallback_candidate_sync(
-                    fb_client, fb_model, fb_label,
-                    task=task, messages=messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, effective_timeout=effective_timeout,
+                    fb_client,
+                    fb_model,
+                    fb_label,
+                    task=task,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config)
                 if fb_resp is not None:
@@ -7693,10 +7743,16 @@ def call_llm(
                     resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
                     fb_resp = _call_fallback_candidate_sync(
-                        fb_client, fb_model, fb_label,
-                        task=task, messages=messages,
-                        temperature=temperature, max_tokens=max_tokens,
-                        tools=tools, effective_timeout=effective_timeout,
+                        fb_client,
+                        fb_model,
+                        fb_label,
+                        task=task,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
@@ -7791,6 +7847,7 @@ async def async_call_llm(
     temperature: Optional[float] = None,
     max_tokens: int = None,
     tools: list = None,
+    tool_choice: str = None,
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
@@ -7876,9 +7933,15 @@ async def async_call_llm(
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
     kwargs = _build_call_kwargs(
-        resolved_provider, final_model, messages,
-        temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
+        resolved_provider,
+        final_model,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=tools,
+        tool_choice=tool_choice,
+        timeout=effective_timeout,
+        extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_client_base or resolved_base_url, task=task)
 
@@ -8075,6 +8138,7 @@ async def async_call_llm(
                     temperature=temperature,
                     max_tokens=max_tokens,
                     tools=tools,
+                    tool_choice=tool_choice,
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
@@ -8113,6 +8177,7 @@ async def async_call_llm(
                         temperature=temperature,
                         max_tokens=max_tokens,
                         tools=tools,
+                        tool_choice=tool_choice,
                         effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
@@ -8200,10 +8265,16 @@ async def async_call_llm(
                     fb_client, fb_model or "", is_vision=(task == "vision")
                 )
                 fb_resp = await _call_fallback_candidate_async(
-                    async_fb, async_fb_model or fb_model, fb_label,
-                    task=task, messages=messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, effective_timeout=effective_timeout,
+                    async_fb,
+                    async_fb_model or fb_model,
+                    fb_label,
+                    task=task,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config)
                 if fb_resp is not None:
@@ -8217,10 +8288,16 @@ async def async_call_llm(
                         fb_client, fb_model or "", is_vision=(task == "vision")
                     )
                     fb_resp = await _call_fallback_candidate_async(
-                        async_fb, async_fb_model or fb_model, fb_label,
-                        task=task, messages=messages,
-                        temperature=temperature, max_tokens=max_tokens,
-                        tools=tools, effective_timeout=effective_timeout,
+                        async_fb,
+                        async_fb_model or fb_model,
+                        fb_label,
+                        task=task,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:

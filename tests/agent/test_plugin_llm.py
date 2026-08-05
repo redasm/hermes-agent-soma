@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -55,7 +56,33 @@ def _fake_response(text: str, *, prompt: int = 4, completion: int = 6) -> Simple
     )
 
 
-def _trusted_policy(plugin_id: str = "trusted-plugin", **overrides: Any) -> _TrustPolicy:
+def _fake_tool_response(name: str, arguments: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    role="assistant",
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call-capability-1",
+                            function=SimpleNamespace(
+                                name=name,
+                                arguments=json.dumps(arguments),
+                            ),
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3, total_tokens=8),
+    )
+
+
+def _trusted_policy(
+    plugin_id: str = "trusted-plugin", **overrides: Any
+) -> _TrustPolicy:
     defaults = dict(
         allow_provider_override=True,
         allowed_providers=None,
@@ -644,6 +671,53 @@ class TestPluginLlmFacade:
         assert rf["type"] == "json_schema"
         assert rf["json_schema"]["schema"] == schema
 
+    def test_complete_structured_passes_native_tools_and_returns_tool_calls(self):
+        captured: dict = {}
+
+        def fake_caller(**kwargs):
+            captured.update(kwargs)
+            return (
+                "openai",
+                "gpt-4o",
+                _fake_tool_response(
+                    "request_host_task",
+                    {"objective": "Check one external fact."},
+                ),
+            )
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="soma-companion",
+            policy=_TrustPolicy(plugin_id="soma-companion"),
+            sync_caller=fake_caller,
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "request_host_task",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+
+        try:
+            result = llm.complete_structured(
+                instructions="Reply or request one capability.",
+                input=[PluginLlmTextInput(text="check it")],
+                json_mode=True,
+                tools=tools,
+                tool_choice="required",
+            )
+        except TypeError as exc:
+            result = exc
+
+        assert not isinstance(result, TypeError), str(result)
+        assert captured["tools"] == tools
+        assert captured["tool_choice"] == "required"
+        system_prompt = captured["messages"][0]["content"]
+        assert "If you do not call a provided tool" in system_prompt
+        assert result.tool_calls[0].name == "request_host_task"
+
     def test_complete_structured_with_image_passes_image_url_part(self):
         captured: dict = {}
 
@@ -712,6 +786,58 @@ class TestAsyncSurface:
         result = asyncio.run(_run())
         assert result.parsed == {"x": 42}
         assert result.content_type == "json"
+
+    def test_acomplete_structured_passes_native_tools_and_returns_tool_calls(self):
+        captured: dict = {}
+
+        async def fake_async(**kwargs):
+            captured.update(kwargs)
+            return (
+                "openai",
+                "gpt-4o",
+                _fake_tool_response(
+                    "request_visual_capture",
+                    {"objective": "Show what I look like right now."},
+                ),
+            )
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="soma-companion",
+            policy=_TrustPolicy(plugin_id="soma-companion"),
+            async_caller=fake_async,
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "request_visual_capture",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+
+        async def _run():
+            try:
+                return await llm.acomplete_structured(
+                    instructions="Reply or request one capability.",
+                    input=[PluginLlmTextInput(text="让我看看你现在什么样子")],
+                    json_mode=True,
+                    tools=tools,
+                    tool_choice="required",
+                )
+            except TypeError as exc:
+                return exc
+
+        result = asyncio.run(_run())
+
+        assert not isinstance(result, TypeError), str(result)
+        assert captured["tools"] == tools
+        assert captured["tool_choice"] == "required"
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].name == "request_visual_capture"
+        assert result.tool_calls[0].arguments == {
+            "objective": "Show what I look like right now."
+        }
 
 
 # ---------------------------------------------------------------------------
