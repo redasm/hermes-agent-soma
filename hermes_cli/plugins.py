@@ -395,7 +395,13 @@ class PluginContext:
         This is an introspection API, not a model tool. Plugins can select a
         supported adapter path without probing tools and parsing error text.
         """
-        from tools.registry import registry
+        from tools.registry import discover_builtin_tools, registry
+
+        # Plugin registration can inspect the host before the agent tool
+        # pipeline imports model_tools. Ensure built-in capabilities such as
+        # image_generate are visible in that early capability snapshot.
+        if registry.get_entry("image_generate") is None:
+            discover_builtin_tools()
 
         names = registry.get_all_tool_names()
 
