@@ -78,10 +78,10 @@ model couldn't produce valid JSON, `result.parsed` is `None` and
 
 ## What this lane gives you
 
-* **One call, four shapes.** `complete()` for chat,
-  `complete_structured()` for typed JSON, `acomplete()` and
-  `acomplete_structured()` for asyncio. Same arguments, same result
-  objects.
+* **One call, sync or async.** `complete()` for chat,
+  `complete_structured()` for typed JSON, and their async siblings.
+  `acomplete_chat()` additionally preserves native assistant tool calls
+  for plugin-owned dialogue loops.
 * **Host-owned credentials.** OAuth tokens, refresh flows, the
   credential pool, per-task aux overrides — every credential
   concept Hermes already has applies. The plugin never sees a
@@ -217,6 +217,7 @@ result = ctx.llm.complete(
     messages=[{"role": "user", "content": "Hi"}],
     provider=None,         # optional, gated — Hermes provider id (e.g. "openrouter")
     model=None,            # optional, gated — whatever string that provider expects
+    model_config_key=None, # optional — read plugins.<plugin-id>.<key>
     temperature=None,
     max_tokens=None,
     timeout=None,          # seconds
@@ -238,6 +239,29 @@ just `model=` to use the user's active provider with a different
 model on it. Set both to switch providers entirely. Either argument
 without operator opt-in raises `PluginLlmTrustError`.
 
+If a plugin exposes a named model setting to the operator, it should pass the
+setting name instead of copying its value into `model=`:
+
+```yaml
+plugins:
+  my-plugin:
+    dialogue_model: openai/gpt-4o-mini
+```
+
+```python
+result = ctx.llm.complete(
+    messages=messages,
+    model_config_key="dialogue_model",
+)
+```
+
+Hermes resolves the value only from the calling plugin's own
+`plugins.<plugin-id>` section. Because the operator selected that value
+directly, no `allow_model_override` or `allowed_models` duplication is
+required. If the setting is absent or blank, the call inherits the host model.
+The plugin cannot combine `model=` and `model_config_key=`. Arbitrary direct
+`model=` selection remains fail-closed behind the trust gate below.
+
 ### `complete_structured()`
 
 ```python
@@ -254,6 +278,7 @@ result = ctx.llm.complete_structured(
     system_prompt=None,
     provider=None,         # optional, gated
     model=None,            # optional, gated
+    model_config_key=None, # optional — read plugins.<plugin-id>.<key>
     temperature=None,
     max_tokens=None,
     timeout=None,
@@ -280,12 +305,15 @@ against your schema if `jsonschema` is installed.
 
 ```python
 result = await ctx.llm.acomplete(messages=...)
+result = await ctx.llm.acomplete_chat(messages=..., tools=...)
 result = await ctx.llm.acomplete_structured(instructions=..., input=...)
 ```
 
-Same arguments and result types as their sync counterparts. Use
-these from gateway adapters, async hooks, or any plugin code
-already running on an asyncio loop.
+The ordinary async methods mirror their sync counterparts.
+`acomplete_chat()` preserves provider-normalized tool calls and native
+assistant/tool continuation messages for a bounded plugin-owned dialogue
+loop. Use these from gateway adapters, async hooks, or any plugin code already
+running on an asyncio loop.
 
 ### Result attributes
 
@@ -323,6 +351,9 @@ config block, a plugin can:
 
 …and that's it. `provider=`, `model=`, `agent_id=`, and `profile=`
 arguments raise `PluginLlmTrustError` until the operator opts in.
+`model_config_key=` is different: it names an operator-owned scalar setting
+inside the calling plugin's own config section and cannot read another
+plugin's namespace.
 
 **Most plugins never need this section.** A plugin that just calls
 `ctx.llm.complete(messages=...)` with no overrides runs against
@@ -375,6 +406,7 @@ path-derived key for nested plugins (`image_gen/openai`,
 | ↳ allowlist     | —       | `allowed_providers: [...]`       |
 | `model=`        | denied  | `allow_model_override: true`     |
 | ↳ allowlist     | —       | `allowed_models: [...]`          |
+| `model_config_key=` | own namespace only | no duplicate grant |
 | `agent_id=`     | denied  | `allow_agent_id_override: true`  |
 | `profile=`      | denied  | `allow_profile_override: true`   |
 
@@ -391,8 +423,9 @@ it gets the provider gate as well.
   allowed; they don't pick credentials or routes.
 * The default deny posture means an unconfigured plugin can still do
   useful work — it just runs against the active provider and model.
-  Operators only need to think about `plugins.entries` for plugins
-  that want finer routing.
+  Operators only need to think about `plugins.entries` for plugins that
+  directly select routing values. Operator-owned model settings under
+  `plugins.<plugin-id>` use `model_config_key=` instead.
 
 ## What the host owns
 

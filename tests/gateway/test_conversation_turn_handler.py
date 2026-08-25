@@ -228,6 +228,7 @@ async def test_companion_delegation_keeps_executor_output_private_and_returns_so
         lambda **_turn: {
             "action": "delegate",
             "capability_request": request,
+            "task_model": "plugin-must-not-select-executor",
         },
     )
 
@@ -249,6 +250,8 @@ async def test_companion_delegation_keeps_executor_output_private_and_returns_so
     execution = runner._run_agent.await_args.kwargs
     assert execution["internal_execution"] is True
     assert execution["history"] == []
+    assert execution["context_prompt"] == ""
+    assert "model" not in execution
     assert execution["session_id"].endswith(":capability:req-42")
     assert execution["session_key"].endswith(":capability:req-42")
     assert "Run the repository tests." in execution["message"]

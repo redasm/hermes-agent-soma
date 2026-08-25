@@ -22,13 +22,19 @@ The plugin gets ``ctx.llm`` exposed on its
 * ``complete_structured(instructions=..., input=[...], json_schema=...)``
   — bounded structured inference with optional image inputs, JSON
   schema validation, and parsed JSON output.
-* async siblings ``acomplete()`` / ``acomplete_structured()`` for
+* async siblings ``acomplete()`` / ``acomplete_chat()`` /
+  ``acomplete_structured()`` for
   plugins running on asyncio loops (gateway adapters, hooks).
 
 Provider/model/agent_id/profile are explicit keyword arguments — no
 embedded slugs, no shorthands. This mirrors Hermes' main config
 shape (``model.provider`` + ``model.model``) so plugin authors who
 already understand the host config don't have to learn anything new.
+Plugins may also pass ``model_config_key=`` to ask Hermes to read a model
+name from that plugin's own ``plugins.<id>`` config section. In that lane the
+plugin selects only the setting name while the operator selects its value, so
+it does not need a duplicate ``allow_model_override`` grant. Direct ``model=``
+selection remains gated.
 
 The host owns provider routing, auth resolution, timeouts, and
 fallback. The plugin never sees raw OAuth tokens or API keys. All
@@ -146,6 +152,13 @@ class PluginLlmToolCall:
 
 
 @dataclass
+class PluginLlmChatResult(PluginLlmCompleteResult):
+    """Native chat result, including any provider-normalized function calls."""
+
+    tool_calls: tuple[PluginLlmToolCall, ...] = ()
+
+
+@dataclass
 class PluginLlmStructuredResult:
     """Result of :meth:`PluginLlm.complete_structured`.
 
@@ -223,6 +236,7 @@ def _resolve_trust_policy(plugin_id: str) -> _TrustPolicy:
 
     try:
         from hermes_cli.config import load_config
+
         config = load_config() or {}
     except Exception:  # pragma: no cover — config IO failure
         return _TrustPolicy(plugin_id=plugin_id)
@@ -262,6 +276,48 @@ class PluginLlmTrustError(PermissionError):
     """Raised when a plugin attempts an LLM override without trust."""
 
 
+def _resolve_plugin_config_model(
+    plugin_id: str, config_key: Optional[str]
+) -> Optional[str]:
+    """Resolve an operator-selected model from ``plugins.<id>.<config_key>``.
+
+    The plugin supplies only the key name; Hermes reads the value from the
+    plugin's own config namespace. This keeps direct ``model=`` overrides
+    fail-closed while avoiding duplicate authorization for an explicit model
+    setting such as ``dialogue_model``.
+    """
+    if config_key is None:
+        return None
+    key = str(config_key).strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,99}", key):
+        raise ValueError("model_config_key must be one simple plugin config key")
+    if not plugin_id:
+        return None
+
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception:  # pragma: no cover — config IO failure
+        return None
+
+    plugins_cfg = config.get("plugins")
+    if not isinstance(plugins_cfg, dict):
+        return None
+    plugin_cfg = plugins_cfg.get(plugin_id)
+    if not isinstance(plugin_cfg, dict):
+        return None
+    value = plugin_cfg.get(key)
+    if not isinstance(value, str):
+        return None
+    model = value.strip()
+    if not model:
+        return None
+    if len(model) > 200:
+        raise ValueError(f"plugins.{plugin_id}.{key} exceeds 200 characters")
+    return model
+
+
 def _check_overrides(
     policy: _TrustPolicy,
     *,
@@ -269,6 +325,7 @@ def _check_overrides(
     requested_model: Optional[str],
     requested_agent_id: Optional[str],
     requested_profile: Optional[str],
+    configured_model: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Apply the trust gate. Returns the validated overrides as
     ``(provider, model, agent_id, profile)`` or raises
@@ -302,7 +359,12 @@ def _check_overrides(
             )
         final_provider = requested_provider.strip()
 
-    if requested_model:
+    if requested_model and configured_model:
+        raise ValueError("model and model_config_key are mutually exclusive")
+
+    if configured_model:
+        final_model = configured_model
+    elif requested_model:
         if not policy.allow_model_override:
             raise PluginLlmTrustError(
                 f"Plugin {policy.plugin_id!r} cannot override the model "
@@ -435,20 +497,24 @@ def _build_structured_messages(
             user_parts.append({"type": "text", "text": norm["text"]})
         elif norm["type"] == "image":
             if norm.get("url"):
-                user_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": norm["url"]},
-                })
+                user_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": norm["url"]},
+                    }
+                )
             else:
                 data = norm.get("data") or b""
                 if not isinstance(data, (bytes, bytearray)):
                     raise ValueError("image input 'data' must be bytes")
                 b64 = base64.b64encode(data).decode("ascii")
                 mime = norm.get("mime_type") or "image/png"
-                user_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{b64}"},
-                })
+                user_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    }
+                )
 
     messages.append({"role": "user", "content": user_parts})
     return messages
@@ -490,6 +556,7 @@ def _parse_structured_text(
     if json_schema is not None:
         try:
             import jsonschema  # type: ignore[import-untyped]
+
             jsonschema.validate(parsed, json_schema)
         except ImportError:
             # jsonschema is optional; skip strict validation when absent.
@@ -529,9 +596,13 @@ def _extract_usage(response: Any) -> PluginLlmUsage:
 
     usage.input_tokens = _g("prompt_tokens") or _g("input_tokens")
     usage.output_tokens = _g("completion_tokens") or _g("output_tokens")
-    usage.total_tokens = _g("total_tokens") or (usage.input_tokens + usage.output_tokens)
+    usage.total_tokens = _g("total_tokens") or (
+        usage.input_tokens + usage.output_tokens
+    )
     usage.cache_read_tokens = _g("cache_read_input_tokens") or _g("cache_read_tokens")
-    usage.cache_write_tokens = _g("cache_creation_input_tokens") or _g("cache_write_tokens")
+    usage.cache_write_tokens = _g("cache_creation_input_tokens") or _g(
+        "cache_write_tokens"
+    )
     return usage
 
 
@@ -619,6 +690,7 @@ def _resolve_attribution(
     else:
         try:
             from agent.auxiliary_client import _read_main_provider
+
             provider = (_read_main_provider() or "").strip() or "auto"
         except Exception:  # pragma: no cover — defensive
             provider = "auto"
@@ -631,6 +703,7 @@ def _resolve_attribution(
     else:
         try:
             from agent.auxiliary_client import _read_main_model
+
             model = (_read_main_model() or "").strip() or "default"
         except Exception:  # pragma: no cover — defensive
             model = "default"
@@ -673,6 +746,7 @@ class PluginLlm:
         *,
         provider: Optional[str] = None,
         model: Optional[str] = None,
+        model_config_key: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
@@ -687,15 +761,21 @@ class PluginLlm:
         explicit shape as the host's main config (``model.provider``
         + ``model.model``). Each is independently gated by
         ``plugins.entries.<id>.llm.allow_*_override`` (see module
-        docstring).
+        docstring). ``model_config_key`` instead names a scalar setting in
+        ``plugins.<id>``; its operator-provided value is used without a
+        duplicate model-override grant.
         """
         policy = self._policy_loader(self._plugin_id)
+        configured_model = _resolve_plugin_config_model(
+            self._plugin_id, model_config_key
+        )
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
             requested_provider=provider,
             requested_model=model,
             requested_agent_id=agent_id,
             requested_profile=profile,
+            configured_model=configured_model,
         )
         real_provider, real_model, response = self._invoke_sync(
             messages=messages,
@@ -723,7 +803,10 @@ class PluginLlm:
         logger.info(
             "plugin_llm.complete plugin=%s provider=%s model=%s purpose=%s "
             "tokens=%d",
-            self._plugin_id, real_provider, real_model, purpose or "",
+            self._plugin_id,
+            real_provider,
+            real_model,
+            purpose or "",
             usage.total_tokens,
         )
         return result
@@ -741,6 +824,7 @@ class PluginLlm:
         tool_choice: Optional[str] = None,
         provider: Optional[str] = None,
         model: Optional[str] = None,
+        model_config_key: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
@@ -766,12 +850,16 @@ class PluginLlm:
             raise ValueError("complete_structured requires at least one input block")
 
         policy = self._policy_loader(self._plugin_id)
+        configured_model = _resolve_plugin_config_model(
+            self._plugin_id, model_config_key
+        )
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
             requested_provider=provider,
             requested_model=model,
             requested_agent_id=agent_id,
             requested_profile=profile,
+            configured_model=configured_model,
         )
 
         messages = _build_structured_messages(
@@ -783,7 +871,9 @@ class PluginLlm:
             system_prompt=system_prompt,
             tools_available=bool(tools),
         )
-        extra_body = self._json_response_format(json_mode=json_mode, json_schema=json_schema)
+        extra_body = self._json_response_format(
+            json_mode=json_mode, json_schema=json_schema
+        )
 
         real_provider, real_model, response = self._invoke_sync(
             messages=messages,
@@ -822,8 +912,12 @@ class PluginLlm:
         logger.info(
             "plugin_llm.complete_structured plugin=%s provider=%s model=%s "
             "purpose=%s content_type=%s tokens=%d",
-            self._plugin_id, real_provider, real_model, purpose or "",
-            content_type, usage.total_tokens,
+            self._plugin_id,
+            real_provider,
+            real_model,
+            purpose or "",
+            content_type,
+            usage.total_tokens,
         )
         return result
 
@@ -835,6 +929,7 @@ class PluginLlm:
         *,
         provider: Optional[str] = None,
         model: Optional[str] = None,
+        model_config_key: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
@@ -844,12 +939,16 @@ class PluginLlm:
     ) -> PluginLlmCompleteResult:
         """Async sibling of :meth:`complete`."""
         policy = self._policy_loader(self._plugin_id)
+        configured_model = _resolve_plugin_config_model(
+            self._plugin_id, model_config_key
+        )
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
             requested_provider=provider,
             requested_model=model,
             requested_agent_id=agent_id,
             requested_profile=profile,
+            configured_model=configured_model,
         )
         real_provider, real_model, response = await self._invoke_async(
             messages=messages,
@@ -875,6 +974,66 @@ class PluginLlm:
             },
         )
 
+    async def acomplete_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        model_config_key: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
+        agent_id: Optional[str] = None,
+        profile: Optional[str] = None,
+        purpose: Optional[str] = None,
+    ) -> PluginLlmChatResult:
+        """Run native chat messages with optional tools and preserve tool calls.
+
+        Unlike :meth:`acomplete_structured`, this method does not wrap or rebuild
+        ``messages`` and does not request JSON output. It is intended for plugin-owned
+        conversations that need standard assistant/tool continuation semantics.
+        """
+
+        policy = self._policy_loader(self._plugin_id)
+        configured_model = _resolve_plugin_config_model(
+            self._plugin_id, model_config_key
+        )
+        eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
+            policy,
+            requested_provider=provider,
+            requested_model=model,
+            requested_agent_id=agent_id,
+            requested_profile=profile,
+            configured_model=configured_model,
+        )
+        real_provider, real_model, response = await self._invoke_async(
+            messages=messages,
+            provider_override=eff_provider,
+            model_override=eff_model,
+            profile_override=eff_profile,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        return PluginLlmChatResult(
+            text=_extract_text(response),
+            provider=real_provider,
+            model=real_model,
+            agent_id=eff_agent or "default",
+            usage=_extract_usage(response),
+            tool_calls=_extract_tool_calls(response),
+            audit={
+                "plugin_id": self._plugin_id,
+                "purpose": purpose or "",
+                "profile": eff_profile or "",
+            },
+        )
+
     async def acomplete_structured(
         self,
         *,
@@ -888,6 +1047,7 @@ class PluginLlm:
         tool_choice: Optional[str] = None,
         provider: Optional[str] = None,
         model: Optional[str] = None,
+        model_config_key: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
@@ -902,12 +1062,16 @@ class PluginLlm:
             raise ValueError("acomplete_structured requires at least one input block")
 
         policy = self._policy_loader(self._plugin_id)
+        configured_model = _resolve_plugin_config_model(
+            self._plugin_id, model_config_key
+        )
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
             requested_provider=provider,
             requested_model=model,
             requested_agent_id=agent_id,
             requested_profile=profile,
+            configured_model=configured_model,
         )
         messages = _build_structured_messages(
             instructions=instructions,
@@ -918,7 +1082,9 @@ class PluginLlm:
             system_prompt=system_prompt,
             tools_available=bool(tools),
         )
-        extra_body = self._json_response_format(json_mode=json_mode, json_schema=json_schema)
+        extra_body = self._json_response_format(
+            json_mode=json_mode, json_schema=json_schema
+        )
         real_provider, real_model, response = await self._invoke_async(
             messages=messages,
             provider_override=eff_provider,
@@ -1012,6 +1178,7 @@ class PluginLlm:
                 caller_kwargs["tool_choice"] = tool_choice
             return self._sync_caller(**caller_kwargs)
         from agent.auxiliary_client import call_llm
+
         merged_extra = dict(extra_body or {})
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
@@ -1065,6 +1232,7 @@ class PluginLlm:
                 caller_kwargs["tool_choice"] = tool_choice
             return await self._async_caller(**caller_kwargs)
         from agent.auxiliary_client import async_call_llm
+
         merged_extra = dict(extra_body or {})
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
@@ -1120,6 +1288,7 @@ __all__ = [
     "PluginLlmInput",
     "PluginLlmUsage",
     "PluginLlmCompleteResult",
+    "PluginLlmChatResult",
     "PluginLlmStructuredResult",
     "PluginLlmToolCall",
     "PluginLlmTrustError",

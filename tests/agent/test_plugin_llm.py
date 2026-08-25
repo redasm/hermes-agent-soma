@@ -19,6 +19,7 @@ import pytest
 
 from agent.plugin_llm import (
     PluginLlm,
+    PluginLlmChatResult,
     PluginLlmCompleteResult,
     PluginLlmImageInput,
     PluginLlmStructuredResult,
@@ -33,13 +34,14 @@ from agent.plugin_llm import (
     make_plugin_llm_for_test,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _fake_response(text: str, *, prompt: int = 4, completion: int = 6) -> SimpleNamespace:
+def _fake_response(
+    text: str, *, prompt: int = 4, completion: int = 6
+) -> SimpleNamespace:
     """Build an OpenAI-shaped response with the given text + token usage."""
     return SimpleNamespace(
         choices=[
@@ -138,7 +140,9 @@ class TestTrustGate:
 
     def test_default_policy_blocks_profile_override(self):
         policy = _TrustPolicy(plugin_id="locked")
-        with pytest.raises(PluginLlmTrustError, match="cannot override the auth profile"):
+        with pytest.raises(
+            PluginLlmTrustError, match="cannot override the auth profile"
+        ):
             _check_overrides(
                 policy,
                 requested_provider=None,
@@ -562,8 +566,12 @@ class TestPluginLlmFacade:
 
     def test_complete_structured_returns_parsed_json(self):
         def fake_caller(**_kwargs):
-            return "openai", "gpt-4o", _fake_response(
-                '{"language": "French", "is_question": true, "confidence": 0.99}'
+            return (
+                "openai",
+                "gpt-4o",
+                _fake_response(
+                    '{"language": "French", "is_question": true, "confidence": 0.99}'
+                ),
             )
 
         llm = make_plugin_llm_for_test(
@@ -766,6 +774,102 @@ class TestAsyncSurface:
         assert result.text == "async hello"
         assert result.provider == "openai"
 
+    def test_acomplete_chat_preserves_native_messages_and_tool_calls(self):
+        captured: dict = {}
+
+        async def fake_async(**kwargs):
+            captured.update(kwargs)
+            return (
+                "openai",
+                "gpt-4o",
+                _fake_tool_response("request_host_task", {"objective": "Run tests."}),
+            )
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="soma-companion",
+            policy=_TrustPolicy(plugin_id="soma-companion"),
+            async_caller=fake_async,
+        )
+        messages = [
+            {"role": "system", "content": "persona"},
+            {"role": "user", "content": "Run the tests."},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "request_host_task",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+
+        async def _run() -> PluginLlmChatResult:
+            return await llm.acomplete_chat(
+                messages,
+                tools=tools,
+                tool_choice="auto",
+                purpose="companion_dialogue",
+            )
+
+        result = asyncio.run(_run())
+
+        assert captured["messages"] == messages
+        assert captured["tools"] == tools
+        assert captured["tool_choice"] == "auto"
+        assert result.tool_calls[0].name == "request_host_task"
+        assert result.audit["purpose"] == "companion_dialogue"
+
+    def test_acomplete_chat_preserves_assistant_tool_result_continuation(self):
+        captured: dict = {}
+
+        async def fake_async(**kwargs):
+            captured.update(kwargs)
+            return "openai", "gpt-4o", _fake_response("The tests passed.")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="soma-companion",
+            policy=_trusted_policy("soma-companion"),
+            async_caller=fake_async,
+        )
+        messages = [
+            {"role": "user", "content": "Run the tests."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-capability-1",
+                        "type": "function",
+                        "function": {
+                            "name": "request_host_task",
+                            "arguments": '{"objective":"Run tests."}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "request_host_task",
+                "tool_call_id": "call-capability-1",
+                "content": '{"status":"completed","summary":"12 passed"}',
+            },
+        ]
+
+        async def _run() -> PluginLlmChatResult:
+            return await llm.acomplete_chat(
+                messages,
+                model="soma-dialogue-model",
+                purpose="companion_dialogue_finalize",
+            )
+
+        result = asyncio.run(_run())
+
+        assert captured["messages"] == messages
+        assert captured["model_override"] == "soma-dialogue-model"
+        assert result.text == "The tests passed."
+        assert result.audit["purpose"] == "companion_dialogue_finalize"
+
     def test_acomplete_structured_parses_json(self):
         async def fake_async(**_kwargs):
             return "openai", "gpt-4o", _fake_response('{"x": 42}')
@@ -846,6 +950,131 @@ class TestAsyncSurface:
 
 
 class TestConfigDrivenPolicy:
+    def test_plugin_owned_model_config_needs_no_duplicate_override_grant(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            """
+plugins:
+  soma-companion:
+    dialogue_model: soma-dialogue-model
+""",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        from hermes_cli import config as _config_mod
+
+        _config_mod._config_cache = None  # type: ignore[attr-defined]
+        captured = {}
+
+        def fake_caller(**kwargs):
+            captured.update(kwargs)
+            return "custom", "soma-dialogue-model", _fake_response("hello")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="soma-companion",
+            policy=_TrustPolicy(plugin_id="soma-companion"),
+            sync_caller=fake_caller,
+        )
+
+        result = llm.complete(
+            [{"role": "user", "content": "hello"}],
+            model_config_key="dialogue_model",
+        )
+
+        assert captured["model_override"] == "soma-dialogue-model"
+        assert result.model == "soma-dialogue-model"
+
+    def test_plugin_owned_model_config_is_scoped_to_calling_plugin(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            """
+plugins:
+  soma-companion:
+    dialogue_model: soma-dialogue-model
+""",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        from hermes_cli import config as _config_mod
+
+        _config_mod._config_cache = None  # type: ignore[attr-defined]
+        captured = {}
+
+        def fake_caller(**kwargs):
+            captured.update(kwargs)
+            return "custom", "host-model", _fake_response("hello")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="other-plugin",
+            policy=_TrustPolicy(plugin_id="other-plugin"),
+            sync_caller=fake_caller,
+        )
+
+        llm.complete(
+            [{"role": "user", "content": "hello"}],
+            model_config_key="dialogue_model",
+        )
+
+        assert captured["model_override"] is None
+
+    def test_direct_model_override_remains_denied_when_config_model_is_supported(self):
+        llm = make_plugin_llm_for_test(
+            plugin_id="soma-companion",
+            policy=_TrustPolicy(plugin_id="soma-companion"),
+            sync_caller=lambda **_kwargs: None,
+        )
+
+        with pytest.raises(PluginLlmTrustError, match="cannot override the model"):
+            llm.complete(
+                [{"role": "user", "content": "hello"}],
+                model="arbitrary-model",
+            )
+
+    def test_direct_model_and_plugin_config_model_are_mutually_exclusive(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "plugins:\n  soma-companion:\n    dialogue_model: configured-model\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        from hermes_cli import config as _config_mod
+
+        _config_mod._config_cache = None  # type: ignore[attr-defined]
+        llm = make_plugin_llm_for_test(
+            plugin_id="soma-companion",
+            policy=_trusted_policy("soma-companion"),
+            sync_caller=lambda **_kwargs: None,
+        )
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            llm.complete(
+                [{"role": "user", "content": "hello"}],
+                model="direct-model",
+                model_config_key="dialogue_model",
+            )
+
+    def test_plugin_config_model_rejects_nested_or_dynamic_key_paths(self):
+        llm = make_plugin_llm_for_test(
+            plugin_id="soma-companion",
+            policy=_TrustPolicy(plugin_id="soma-companion"),
+            sync_caller=lambda **_kwargs: None,
+        )
+
+        with pytest.raises(ValueError, match="one simple plugin config key"):
+            llm.complete(
+                [{"role": "user", "content": "hello"}],
+                model_config_key="../other-plugin/model",
+            )
+
     def test_policy_loaded_from_yaml(self, tmp_path, monkeypatch):
         from agent.plugin_llm import _resolve_trust_policy
 
@@ -869,6 +1098,7 @@ plugins:
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         from hermes_cli import config as _config_mod
+
         _config_mod._config_cache = None  # type: ignore[attr-defined]
 
         policy = _resolve_trust_policy("my-plugin")
@@ -876,9 +1106,12 @@ plugins:
         assert policy.allow_model_override is True
         assert policy.allow_profile_override is False
         assert policy.allowed_providers == frozenset({"openrouter", "anthropic"})
-        assert policy.allowed_models == frozenset({
-            "openai/gpt-4o-mini", "anthropic/claude-3-5-haiku",
-        })
+        assert policy.allowed_models == frozenset(
+            {
+                "openai/gpt-4o-mini",
+                "anthropic/claude-3-5-haiku",
+            }
+        )
 
     def test_missing_plugin_entry_yields_default_deny(self, tmp_path, monkeypatch):
         from agent.plugin_llm import _resolve_trust_policy
@@ -888,6 +1121,7 @@ plugins:
         (hermes_home / "config.yaml").write_text("plugins: {}\n", encoding="utf-8")
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         from hermes_cli import config as _config_mod
+
         _config_mod._config_cache = None  # type: ignore[attr-defined]
 
         policy = _resolve_trust_policy("never-configured")
@@ -973,7 +1207,9 @@ class TestAttribution:
         import agent.auxiliary_client as ac
 
         monkeypatch.setattr(ac, "_read_main_provider", lambda: "openrouter")
-        monkeypatch.setattr(ac, "_read_main_model", lambda: "anthropic/claude-3-5-sonnet")
+        monkeypatch.setattr(
+            ac, "_read_main_model", lambda: "anthropic/claude-3-5-sonnet"
+        )
 
         response = SimpleNamespace(choices=[])  # no .model attribute
         provider, model = plugin_llm._resolve_attribution(
@@ -1082,8 +1318,11 @@ class TestHookMode:
         assert len(captured) == 2  # one llm call + one hook return record
         llm_call = captured[0]
         assert "messages" in llm_call
-        assert any("rewrite" in m.get("content", "").lower()
-                   for m in llm_call["messages"] if isinstance(m, dict))
+        assert any(
+            "rewrite" in m.get("content", "").lower()
+            for m in llm_call["messages"]
+            if isinstance(m, dict)
+        )
         hook_record = captured[1]
         assert hook_record["hook_returned"] == "rewrote it"
 

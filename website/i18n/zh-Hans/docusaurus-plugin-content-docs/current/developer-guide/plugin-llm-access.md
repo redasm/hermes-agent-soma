@@ -66,7 +66,7 @@ if result.parsed["urgency"] > 0.8:
 
 ## 此模式的优势
 
-* **一次调用，四种形态。** `complete()` 用于对话，`complete_structured()` 用于有类型的 JSON，`acomplete()` 和 `acomplete_structured()` 用于 asyncio。参数相同，结果对象相同。
+* **一次调用，同步或异步。** `complete()` 用于对话，`complete_structured()` 用于有类型的 JSON，并提供对应的异步接口。`acomplete_chat()` 还会保留 plugin 自有对话循环中的原生 assistant 工具调用。
 * **宿主持有凭据。** OAuth token、刷新流程、凭据池、每任务辅助覆盖——Hermes 已有的所有凭据概念均适用。Plugin 永远看不到 token；宿主通过 `result.audit` 将调用归因回溯。
 * **有界。** 单次同步或异步调用。无流式输出，无工具循环，无需管理对话状态。给定输入，获取结果，返回。
 * **失败关闭信任。** 从未配置过的 plugin 无法自行选择 provider、模型、agent 或存储的凭据。默认行为是"使用用户正在使用的"。运营人员在 `config.yaml` 中按 plugin 逐一选择开启特定覆盖。
@@ -187,6 +187,7 @@ result = ctx.llm.complete(
     messages=[{"role": "user", "content": "Hi"}],
     provider=None,         # 可选，受门控——Hermes provider id（如 "openrouter"）
     model=None,            # 可选，受门控——该 provider 期望的任意字符串
+    model_config_key=None, # 可选——读取 plugins.<plugin-id>.<key>
     temperature=None,
     max_tokens=None,
     timeout=None,          # 秒
@@ -200,6 +201,23 @@ result = ctx.llm.complete(
 普通对话补全。`messages` 采用标准 OpenAI 格式——`{"role": "...", "content": "..."}` 字典列表。多轮 prompt（system + few-shot user/assistant 对 + 最终 user）的用法与 OpenAI SDK 完全一致。
 
 `provider=` 和 `model=` 相互独立，格式与宿主主配置（`model.provider` + `model.model`）相同。仅设置 `model=` 可在用户当前激活的 provider 上使用不同模型。同时设置两者则完全切换 provider。任一参数在未获运营人员授权时均会抛出 `PluginLlmTrustError`。
+
+如果 plugin 向运营人员暴露一个具名模型设置，应传递设置名称，而不是先读取其值再放入 `model=`：
+
+```yaml
+plugins:
+  my-plugin:
+    dialogue_model: openai/gpt-4o-mini
+```
+
+```python
+result = ctx.llm.complete(
+    messages=messages,
+    model_config_key="dialogue_model",
+)
+```
+
+Hermes 只会从调用方自己的 `plugins.<plugin-id>` 配置段解析该值。由于值由运营人员直接选择，因此无需重复配置 `allow_model_override` 或 `allowed_models`。设置缺失或为空时，本次调用继承宿主模型。`model=` 与 `model_config_key=` 不能同时使用；任意直接 `model=` 选择仍由下方信任门控以失败关闭方式保护。
 
 ### `complete_structured()`
 
@@ -217,6 +235,7 @@ result = ctx.llm.complete_structured(
     system_prompt=None,
     provider=None,         # 可选，受门控
     model=None,            # 可选，受门控
+    model_config_key=None, # 可选——读取 plugins.<plugin-id>.<key>
     temperature=None,
     max_tokens=None,
     timeout=None,
@@ -237,10 +256,11 @@ result = ctx.llm.complete_structured(
 
 ```python
 result = await ctx.llm.acomplete(messages=...)
+result = await ctx.llm.acomplete_chat(messages=..., tools=...)
 result = await ctx.llm.acomplete_structured(instructions=..., input=...)
 ```
 
-参数和结果类型与对应的同步版本相同。在 gateway 适配器、异步 hook 或任何已运行在 asyncio 事件循环上的 plugin 代码中使用。
+普通异步方法的参数和结果类型与对应同步版本相同。`acomplete_chat()` 会保留 provider 归一化后的工具调用，以及原生 assistant/tool 延续消息，供有界的 plugin 自有对话循环使用。在 gateway 适配器、异步 hook 或任何已运行在 asyncio 事件循环上的 plugin 代码中使用。
 
 ### 结果属性
 
@@ -271,6 +291,7 @@ class PluginLlmStructuredResult(PluginLlmCompleteResult):
 * 设置请求塑形参数（`temperature`、`max_tokens`、`timeout`、`system_prompt`、`purpose`、`messages`、`instructions`、`input`、`json_schema`），
 
 ……仅此而已。`provider=`、`model=`、`agent_id=` 和 `profile=` 参数在运营人员授权前均会抛出 `PluginLlmTrustError`。
+`model_config_key=` 不同：它只能命名调用方自身配置段中的运营人员所有标量设置，不能读取其他 plugin 的命名空间。
 
 **大多数 plugin 永远不需要此部分。** 仅调用 `ctx.llm.complete(messages=...)` 且不带任何覆盖的 plugin，会针对用户当前激活的内容运行，零配置即可工作。以下配置块仅在 plugin 明确需要固定到与用户不同的模型或 provider 时才有意义。
 
@@ -317,6 +338,7 @@ Plugin id 对于扁平 plugin 是 manifest 中的 `name:` 字段，对于嵌套 
 | ↳ 允许列表      | —     | `allowed_providers: [...]`       |
 | `model=`        | 拒绝  | `allow_model_override: true`     |
 | ↳ 允许列表      | —     | `allowed_models: [...]`          |
+| `model_config_key=` | 仅自身命名空间 | 无需重复授权 |
 | `agent_id=`     | 拒绝  | `allow_agent_id_override: true`  |
 | `profile=`      | 拒绝  | `allow_profile_override: true`   |
 
@@ -325,7 +347,7 @@ Plugin id 对于扁平 plugin 是 manifest 中的 `name:` 字段，对于嵌套 
 ### 门控无需执行的内容
 
 * 请求塑形参数——`temperature`、`max_tokens`、`timeout`、`system_prompt`、`purpose`、`messages`、`instructions`、`input`、`json_schema`、`schema_name`、`json_mode`——始终允许；它们不涉及凭据或路由选择。
-* 默认拒绝策略意味着未配置的 plugin 仍可完成有用的工作——只是针对当前激活的 provider 和模型运行。运营人员只需在 plugin 明确需要更精细路由时才考虑 `plugins.entries`。
+* 默认拒绝策略意味着未配置的 plugin 仍可完成有用的工作——只是针对当前激活的 provider 和模型运行。只有 plugin 直接选择路由值时，运营人员才需考虑 `plugins.entries`；位于 `plugins.<plugin-id>` 下、由运营人员所有的模型设置应通过 `model_config_key=` 使用。
 
 ## 宿主负责的内容
 
