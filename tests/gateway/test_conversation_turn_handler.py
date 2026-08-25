@@ -372,6 +372,42 @@ async def test_visual_capture_executor_dispatches_image_generate_once(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_visual_capture_executor_preserves_provider_failure_detail(caplog):
+    from gateway.conversation_turn import execute_visual_capture
+
+    def dispatch(_name, _args, **_kwargs):
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "model gpt-image-2 was discontinued by the configured provider; "
+                    "api_key=sk-secret"
+                ),
+                "error_type": "model_unavailable",
+            }
+        )
+
+    result = await execute_visual_capture(
+        {
+            "request_id": "capability:visual-discontinued",
+            "kind": "visual_capture",
+            "objective": "Take one casual phone photo.",
+            "visual_grounding": '{"appearance":"stable"}',
+        },
+        dispatch_tool=dispatch,
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "model_unavailable"
+    assert "discontinued" in result["summary"]
+    assert "sk-secret" not in result["summary"]
+    assert "[REDACTED]" in result["summary"]
+    assert "model_unavailable" in caplog.text
+    assert "discontinued" in caplog.text
+    assert "sk-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_visual_capture_executor_discovers_image_tool_before_dispatch(
     monkeypatch,
     tmp_path,

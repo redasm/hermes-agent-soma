@@ -41,6 +41,28 @@ from agent.image_gen_provider import (
 logger = logging.getLogger(__name__)
 
 
+def _api_error_type(exc: Exception) -> str:
+    """Classify common compatible-endpoint failures without losing the detail."""
+
+    status_code = getattr(exc, "status_code", None)
+    message = str(exc).casefold()
+    if status_code in {401, 403}:
+        return "auth_error"
+    if status_code == 429:
+        return "rate_limited"
+    if any(
+        marker in message
+        for marker in (
+            "model is not available",
+            "model not available",
+            "has been discontinued",
+            "model has been discontinued",
+        )
+    ):
+        return "model_unavailable"
+    return "api_error"
+
+
 # ---------------------------------------------------------------------------
 # Model catalog
 # ---------------------------------------------------------------------------
@@ -280,7 +302,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
         sources: List[str] = []
         if isinstance(image_url, str) and image_url.strip():
             sources.append(image_url.strip())
-        for ref in (normalize_reference_images(reference_image_urls) or []):
+        for ref in normalize_reference_images(reference_image_urls) or []:
             sources.append(ref)
         sources = sources[:16]  # gpt-image-2 edit caps at 16 images
         is_edit = bool(sources)
@@ -323,7 +345,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 logger.debug("OpenAI image edit failed", exc_info=True)
                 return error_response(
                     error=f"OpenAI image editing failed: {exc}",
-                    error_type="api_error",
+                    error_type=_api_error_type(exc),
                     provider="openai",
                     model=tier_id,
                     prompt=prompt,
@@ -354,7 +376,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 logger.debug("OpenAI image generation failed", exc_info=True)
                 return error_response(
                     error=f"OpenAI image generation failed: {exc}",
-                    error_type="api_error",
+                    error_type=_api_error_type(exc),
                     provider="openai",
                     model=tier_id,
                     prompt=prompt,

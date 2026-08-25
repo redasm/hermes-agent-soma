@@ -10,7 +10,6 @@ import pytest
 
 import plugins.image_gen.openai as openai_plugin
 
-
 # 1×1 transparent PNG — valid bytes for save_b64_image()
 _PNG_HEX = (
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
@@ -21,6 +20,7 @@ _PNG_HEX = (
 
 def _b64_png() -> str:
     import base64
+
     return base64.b64encode(bytes.fromhex(_PNG_HEX)).decode()
 
 
@@ -121,6 +121,7 @@ class TestModelResolution:
 
     def test_config_openai_model(self, tmp_path):
         import yaml
+
         (tmp_path / "config.yaml").write_text(
             yaml.safe_dump({"image_gen": {"openai": {"model": "gpt-image-2-low"}}})
         )
@@ -131,6 +132,7 @@ class TestModelResolution:
     def test_config_top_level_model(self, tmp_path):
         """``image_gen.model: gpt-image-2-high`` also works (top-level)."""
         import yaml
+
         (tmp_path / "config.yaml").write_text(
             yaml.safe_dump({"image_gen": {"model": "gpt-image-2-high"}})
         )
@@ -153,7 +155,9 @@ class TestSourceImageLoading:
         with pytest.raises(ValueError, match="credential store"):
             openai_plugin._load_image_bytes(str(auth_json))
 
-    def test_load_image_bytes_never_opens_blocked_credential(self, tmp_path, monkeypatch):
+    def test_load_image_bytes_never_opens_blocked_credential(
+        self, tmp_path, monkeypatch
+    ):
         """The guard must fire BEFORE the file is opened — a credential store
         must never be read into memory (#57698). Spy builtins.open and assert
         it is never called for the blocked path."""
@@ -190,7 +194,9 @@ class TestSourceImageLoading:
         assert data == b"\x89PNG\r\n\x1a\nfake-image-bytes"
         assert name == "pic.png"
 
-    def test_load_image_bytes_passthrough_data_uri_not_blocked(self, tmp_path, monkeypatch):
+    def test_load_image_bytes_passthrough_data_uri_not_blocked(
+        self, tmp_path, monkeypatch
+    ):
         """Negative control: data: URIs are decoded, never routed through the
         local-path guard (the guard only applies to local file reads)."""
         import base64
@@ -275,11 +281,14 @@ class TestGenerate:
         # gpt-image-2 rejects response_format — we must NOT send it.
         assert "response_format" not in call_kwargs
 
-    @pytest.mark.parametrize("tier,expected_quality", [
-        ("gpt-image-2-low", "low"),
-        ("gpt-image-2-medium", "medium"),
-        ("gpt-image-2-high", "high"),
-    ])
+    @pytest.mark.parametrize(
+        "tier,expected_quality",
+        [
+            ("gpt-image-2-low", "low"),
+            ("gpt-image-2-medium", "medium"),
+            ("gpt-image-2-high", "high"),
+        ],
+    )
     def test_tier_maps_to_quality(self, provider, monkeypatch, tier, expected_quality):
         monkeypatch.setenv("OPENAI_IMAGE_MODEL", tier)
         fake_client = MagicMock()
@@ -290,15 +299,20 @@ class TestGenerate:
 
         assert result["model"] == tier
         assert result["quality"] == expected_quality
-        assert fake_client.images.generate.call_args.kwargs["quality"] == expected_quality
+        assert (
+            fake_client.images.generate.call_args.kwargs["quality"] == expected_quality
+        )
         # Always the same underlying API model regardless of tier.
         assert fake_client.images.generate.call_args.kwargs["model"] == "gpt-image-2"
 
-    @pytest.mark.parametrize("aspect,expected_size", [
-        ("landscape", "1536x1024"),
-        ("square", "1024x1024"),
-        ("portrait", "1024x1536"),
-    ])
+    @pytest.mark.parametrize(
+        "aspect,expected_size",
+        [
+            ("landscape", "1536x1024"),
+            ("square", "1024x1024"),
+            ("portrait", "1024x1536"),
+        ],
+    )
     def test_aspect_ratio_mapping(self, provider, aspect, expected_size):
         fake_client = MagicMock()
         fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
@@ -311,7 +325,8 @@ class TestGenerate:
     def test_revised_prompt_passed_through(self, provider):
         fake_client = MagicMock()
         fake_client.images.generate.return_value = _fake_response(
-            b64=_b64_png(), revised_prompt="A photo of a cat",
+            b64=_b64_png(),
+            revised_prompt="A photo of a cat",
         )
 
         with _patched_openai(fake_client):
@@ -329,6 +344,22 @@ class TestGenerate:
         assert result["success"] is False
         assert result["error_type"] == "api_error"
         assert "boom" in result["error"]
+
+    def test_discontinued_model_is_reported_as_model_unavailable(self, provider):
+        class DiscontinuedModelError(RuntimeError):
+            status_code = 400
+
+        fake_client = MagicMock()
+        fake_client.images.generate.side_effect = DiscontinuedModelError(
+            "model gpt-image-2 is not available: image generation has been discontinued"
+        )
+
+        with _patched_openai(fake_client):
+            result = provider.generate("a cat")
+
+        assert result["success"] is False
+        assert result["error_type"] == "model_unavailable"
+        assert "discontinued" in result["error"]
 
     def test_empty_response_data(self, provider):
         fake_client = MagicMock()
@@ -350,13 +381,19 @@ class TestGenerate:
         """
         fake_client = MagicMock()
         fake_client.images.generate.return_value = _fake_response(
-            b64=None, url="https://example.com/img.png",
+            b64=None,
+            url="https://example.com/img.png",
         )
 
-        with _patched_openai(fake_client), patch(
-            "plugins.image_gen.openai.save_url_image",
-            return_value=Path("/tmp/openai_gpt-image-2_20260524_000000_deadbeef.png"),
-        ) as mock_save_url:
+        with (
+            _patched_openai(fake_client),
+            patch(
+                "plugins.image_gen.openai.save_url_image",
+                return_value=Path(
+                    "/tmp/openai_gpt-image-2_20260524_000000_deadbeef.png"
+                ),
+            ) as mock_save_url,
+        ):
             result = provider.generate("a cat")
 
         assert result["success"] is True
@@ -370,12 +407,16 @@ class TestGenerate:
 
         fake_client = MagicMock()
         fake_client.images.generate.return_value = _fake_response(
-            b64=None, url="https://example.com/img.png",
+            b64=None,
+            url="https://example.com/img.png",
         )
 
-        with _patched_openai(fake_client), patch(
-            "plugins.image_gen.openai.save_url_image",
-            side_effect=req_lib.HTTPError("404 from CDN"),
+        with (
+            _patched_openai(fake_client),
+            patch(
+                "plugins.image_gen.openai.save_url_image",
+                side_effect=req_lib.HTTPError("404 from CDN"),
+            ),
         ):
             result = provider.generate("a cat")
 

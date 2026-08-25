@@ -14,6 +14,15 @@ _VISUAL_MEDIA_RE = re.compile(
     r"MEDIA:((?:[A-Za-z]:[/\\]|/|~/)[^\r\n]+?\.(?:png|jpe?g|gif|webp))(?=\s*$)",
     re.IGNORECASE | re.MULTILINE,
 )
+_CAPABILITY_SECRET_RE = re.compile(
+    r"(?i)\b(authorization|api[_ -]?key|access[_ -]?token|token|secret)\b"
+    r"\s*[:=]\s*(?:bearer\s+)?[^\s,;}\]]+"
+)
+
+
+def _sanitize_capability_error(value: Any) -> str:
+    text = _CAPABILITY_SECRET_RE.sub(r"\1=[REDACTED]", str(value or ""))
+    return " ".join(text.split())[:20_000]
 
 
 def interaction_mode(config: Any) -> str:
@@ -259,12 +268,15 @@ async def execute_visual_capture(
     error_summary = "The host image tool did not produce a deliverable image."
     error_code = "image_generation_failed"
     if isinstance(payload, dict):
-        error_summary = str(payload.get("error") or error_summary).strip()[:20_000]
+        error_summary = _sanitize_capability_error(
+            payload.get("error") or error_summary
+        )
         error_code = str(payload.get("error_type") or error_code).strip()[:200]
     logger.warning(
-        "Visual capability %s failed through image_generate: %s",
+        "Visual capability %s failed through image_generate: %s (%s)",
         capability_request.get("request_id"),
         error_code,
+        " ".join(error_summary.split())[:500],
     )
     return capability_task_result(
         capability_request,
