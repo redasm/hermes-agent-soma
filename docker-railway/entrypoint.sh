@@ -35,6 +35,14 @@ else
   echo "[entrypoint] WARNING: could not locate soma companion SOUL.md"
 fi
 
+# --- 2c. Patch ethos-soul to bypass execution_owner check (Railway runs as hermes) ---
+ETHOS_INIT=$(python3 -c "import ethos.integrations.hermes, os; print(os.path.join(os.path.dirname(ethos.integrations.hermes.__file__), '__init__.py'))" 2>/dev/null || echo "")
+if [ -n "$ETHOS_INIT" ] && [ -f "$ETHOS_INIT" ]; then
+  # Replace the execution_owner guard to always activate persona
+  sed -i 's/if kwargs.get("execution_owner") != "soma":/if False:  # patched for Railway: always activate persona/' "$ETHOS_INIT"
+  echo "[entrypoint] patched ethos-soul execution_owner check"
+fi
+
 # --- 3. Seed model config if none exists (SiliconFlow DeepSeek-V3) ---
 if [ -n "${SEED_CONFIG:-}" ]; then
   echo "$SEED_CONFIG" > "$HERMES_DIR/config.yaml"
