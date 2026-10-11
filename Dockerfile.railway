@@ -29,6 +29,5 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # ~/.hermes is the Railway volume mount point (persistent state)
 RUN mkdir -p /root/.hermes
-VOLUME ["/root/.hermes"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
