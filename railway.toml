@@ -1,6 +1,6 @@
 [build]
+builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile.railway"
 
 [deploy]
-startCommand = "/usr/local/bin/entrypoint.sh"
 restartPolicyType = "always"

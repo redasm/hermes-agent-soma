@@ -18,8 +18,13 @@ WORKDIR /opt/hermes
 # for reproducible builds. No dev/test/docs extras.
 COPY pyproject.toml uv.lock ./
 RUN touch README.md && \
-    uv sync --frozen --no-install-project --extra messaging && \
-    uv pip install --system -e .
+    uv sync --frozen --no-install-project --extra messaging
+
+# Copy the full source tree so the editable install below has code to link.
+# (.dockerignore excludes node_modules/.git/tests/docs/website/apps)
+COPY . ./
+
+RUN uv pip install --system -e .
 
 # soma-companion is installed at container startup from the private repo
 # (needs GITHUB_TOKEN env var) so the token never lands in the image.
