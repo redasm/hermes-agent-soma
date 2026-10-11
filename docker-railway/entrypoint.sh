@@ -27,8 +27,9 @@ else
 fi
 
 # --- 3. Seed model config if none exists (SiliconFlow DeepSeek-V3) ---
-if [ ! -f "$HERMES_DIR/config.yaml" ] && [ -n "${SEED_CONFIG:-}" ]; then
+if [ -n "${SEED_CONFIG:-}" ]; then
   echo "$SEED_CONFIG" > "$HERMES_DIR/config.yaml"
+  echo "[entrypoint] wrote config.yaml from SEED_CONFIG"
 fi
 
 # --- 4. Start gateway in foreground (Railway expects PID 1 to stay up) ---
