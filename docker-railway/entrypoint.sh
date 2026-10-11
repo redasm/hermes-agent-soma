@@ -26,6 +26,15 @@ else
   echo "[entrypoint] WARNING: GITHUB_TOKEN not set, skipping soma-companion"
 fi
 
+# --- 2b. Install Soma persona (SOUL.md) for ethos-soul ---
+SOUL_SRC=$(python3 -c "import soma, os; print(os.path.join(os.path.dirname(soma.__file__), 'companion', 'SOUL.md'))" 2>/dev/null || echo "")
+if [ -n "$SOUL_SRC" ] && [ -f "$SOUL_SRC" ]; then
+  cp "$SOUL_SRC" "$HERMES_DIR/SOUL.md"
+  echo "[entrypoint] installed SOUL.md from soma-companion"
+else
+  echo "[entrypoint] WARNING: could not locate soma companion SOUL.md"
+fi
+
 # --- 3. Seed model config if none exists (SiliconFlow DeepSeek-V3) ---
 if [ -n "${SEED_CONFIG:-}" ]; then
   echo "$SEED_CONFIG" > "$HERMES_DIR/config.yaml"
