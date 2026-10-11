@@ -1,0 +1,34 @@
+# Lightweight Hermes gateway image for Railway free tier.
+# Only gateway + Telegram + soma-companion. No Playwright, dashboard,
+# s6-overlay, Node.js. Built for 0.5GB RAM / 0.1 vCPU.
+FROM python:3.13-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_SYSTEM_PYTHON=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir uv==0.11.6
+
+WORKDIR /opt/hermes
+
+# Install hermes-agent with messaging extra (Telegram). Frozen lockfile
+# for reproducible builds. No dev/test/docs extras.
+COPY pyproject.toml uv.lock ./
+RUN touch README.md && \
+    uv sync --frozen --no-install-project --extra messaging && \
+    uv pip install --system -e .
+
+# soma-companion is installed at container startup from the private repo
+# (needs GITHUB_TOKEN env var) so the token never lands in the image.
+
+COPY docker-railway/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# ~/.hermes is the Railway volume mount point (persistent state)
+RUN mkdir -p /root/.hermes
+VOLUME ["/root/.hermes"]
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
