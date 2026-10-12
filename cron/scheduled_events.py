@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,10 +21,13 @@ def _default_path() -> Path:
 
 
 def _parse_timestamp(value: str) -> datetime:
-    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(str(value))
     if parsed.tzinfo is None:
         raise ValueError("due_at must include a timezone")
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(UTC)
+
+
+logger = logging.getLogger(__name__)
 
 
 class ScheduledEventStore:
@@ -96,7 +100,7 @@ class ScheduledEventStore:
         lease_seconds: int = 300,
         max_attempts: int = 5,
     ) -> list[dict[str, Any]]:
-        current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        current_time = (now or datetime.now(UTC)).astimezone(UTC)
         with _jobs_lock():
             events = self._load()
             due = [
@@ -149,7 +153,7 @@ class ScheduledEventStore:
                 "failed_retryable" if retryable and attempts < max_attempts else "failed_terminal"
             )
             event["last_error_category"] = str(error_category or "unknown")[:80]
-            event["failed_at"] = datetime.now(timezone.utc).isoformat()
+            event["failed_at"] = datetime.now(UTC).isoformat()
             self._save(events)
             return True
 
@@ -167,7 +171,7 @@ class ScheduledEventStore:
             if event is None:
                 return False
             event["status"] = status
-            event["completed_at"] = datetime.now(timezone.utc).isoformat()
+            event["completed_at"] = datetime.now(UTC).isoformat()
             self._save(events)
             return True
 
@@ -212,7 +216,7 @@ class ScheduledEventStore:
 
     def _load(self) -> list[dict[str, Any]]:
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            payload = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except FileNotFoundError:
             return []
         if not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
@@ -311,6 +315,7 @@ def dispatch_due_scheduled_events(
                 else deliver(event, request)
             )
         except Exception:
+            logger.exception("Scheduled outreach delivery failed")
             event_store.nack(
                 event["event_id"],
                 event["generation"],
@@ -363,10 +368,11 @@ def _emit_lifecycle(
             attempt_count=int(event.get("attempt_count", 0)),
             lateness_seconds=max(
                 0.0,
-                (datetime.now(timezone.utc) - due_at).total_seconds(),
+                (datetime.now(UTC) - due_at).total_seconds(),
             ),
         )
     except Exception:
+        logger.exception("Scheduled event lifecycle hook failed")
         return
 
 
@@ -427,6 +433,7 @@ def _recent_verified_origin(subject_id: str, adapters: Any) -> dict[str, Any] | 
         finally:
             database.close()
     except Exception:
+        logger.exception("Failed to resolve a verified scheduled outreach origin")
         return None
     for row in rows:
         origin = _session_origin(row)

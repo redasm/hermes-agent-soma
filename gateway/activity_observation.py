@@ -12,10 +12,11 @@ import asyncio
 import os
 import queue
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Any, AsyncIterator, Callable, Iterable
 
 import psutil
+from agent.memory_provider import spawn_context_thread
 
 _STOP = object()
 
@@ -55,8 +56,8 @@ class LocalApplicationObservationPort:
         self._events = queue.Queue()
         self._stop = threading.Event()
         self._envelope = {"subject_id": subject_id, "session_id": session_id}
-        self._thread = threading.Thread(
-            target=self._poll,
+        self._thread = spawn_context_thread(
+            self._poll,
             args=(self._stop, self._events, dict(self._envelope)),
             name="hermes-activity-observation",
             daemon=True,
@@ -95,7 +96,7 @@ class LocalApplicationObservationPort:
                     {
                         **envelope,
                         "origin": "local_process",
-                        "occurred_at": datetime.now(timezone.utc).isoformat(),
+                        "occurred_at": datetime.now(UTC).isoformat(),
                         "state": "started" if running else "stopped",
                         "application": self._label,
                     }

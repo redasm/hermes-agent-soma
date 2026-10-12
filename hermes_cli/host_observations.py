@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-import os
 import platform
 import subprocess
+from tools.environments.local import served_profile_child_env
 from typing import Any
 
 
@@ -54,7 +54,7 @@ def _run_windows_location() -> dict[str, Any] | str | None:
             timeout=3,
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            env=os.environ.copy(),
+            env=served_profile_child_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return None

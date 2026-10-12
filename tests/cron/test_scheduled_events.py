@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 
 from cron.scheduled_events import (
     ScheduledEventStore,
@@ -15,7 +15,7 @@ def _event(*, event_id: str = "deadline-1", due_at: datetime | None = None) -> d
     return {
         "event_id": event_id,
         "subject_id": "user:local",
-        "due_at": (due_at or datetime.now(timezone.utc)).isoformat(),
+        "due_at": (due_at or datetime.now(UTC)).isoformat(),
         "event_type": "idle_reconsideration",
         "correlation_id": "turn-123",
     }
@@ -38,7 +38,7 @@ def test_changed_upsert_replaces_event_and_advances_generation(tmp_path):
     store = ScheduledEventStore(tmp_path / "scheduled_events.json")
     first = store.upsert(**_event())
     changed = store.upsert(
-        **_event(due_at=datetime.now(timezone.utc) + timedelta(hours=1))
+        **_event(due_at=datetime.now(UTC) + timedelta(hours=1))
     )
 
     assert changed["generation"] == first["generation"] + 1
@@ -73,7 +73,7 @@ def test_unfinished_claim_is_recovered_after_its_lease_expires(tmp_path):
     path = tmp_path / "scheduled_events.json"
     ScheduledEventStore(path).upsert(**_event())
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     claimed = ScheduledEventStore(path).claim_due(now=now, lease_seconds=30)
     after_restart = ScheduledEventStore(path)
 
@@ -206,7 +206,7 @@ def test_due_event_invokes_typed_hook_once(tmp_path, monkeypatch):
 def test_scheduler_tick_dispatches_events_without_cron_jobs(tmp_path, monkeypatch):
     from cron import scheduler
 
-    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [])
+    monkeypatch.setattr(scheduler, "get_due_jobs", list)
     monkeypatch.setattr(scheduler, "dispatch_due_scheduled_events", lambda **_kwargs: 1)
     monkeypatch.setattr(scheduler, "_get_lock_paths", lambda: (tmp_path, tmp_path / "tick.lock"))
 

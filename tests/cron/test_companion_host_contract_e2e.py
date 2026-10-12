@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 def test_plugin_context_scheduler_and_delivery_form_one_private_receipt_pipeline(
     tmp_path, monkeypatch
 ):
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
     from cron.scheduler import (
         _build_job_prompt,
         _deliver_result_with_receipt,

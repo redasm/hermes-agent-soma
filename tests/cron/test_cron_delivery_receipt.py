@@ -157,7 +157,7 @@ def test_delivery_receipt_hook_receives_structured_data(monkeypatch):
 
 
 def test_legacy_delivery_entrypoint_emits_receipt(monkeypatch):
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     receipt = scheduler.CronDeliveryReceipt(job_id="job-1", status="skipped")
     observed = []
@@ -189,7 +189,7 @@ def test_schema_exposes_metadata_as_non_prompt_correlation_data():
 
 def test_public_web_job_views_hide_internal_metadata():
     from gateway.platforms.api_server import _public_cron_job
-    from hermes_cli.web_server import _annotate_cron_job
+    from hermes_cli.web_server_cron import _annotate_cron_job
 
     job = {
         "id": "job-1",
@@ -226,7 +226,7 @@ def test_registry_handler_forwards_companion_cron_fields(monkeypatch):
     monkeypatch.setattr(cron_tools, "cronjob", fake_cronjob)
 
     result = registry.dispatch(
-        "cronjob",
+        "cronjob_manage",
         {
             "action": "create",
             "schedule": "every 1h",
@@ -246,13 +246,13 @@ def test_registry_handler_forwards_companion_cron_fields(monkeypatch):
 
 
 def test_silent_cron_run_emits_skipped_receipt_without_delivery(monkeypatch):
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     receipts = []
     monkeypatch.setattr(
         scheduler,
         "run_job",
-        lambda job, defer_agent_teardown=None: (True, "output", "[SILENT]", None),
+        lambda job, defer_agent_teardown=None, **kwargs: (True, "output", "[SILENT]", None),
     )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *args: "/tmp/out")
     monkeypatch.setattr(
@@ -279,7 +279,7 @@ def test_silent_cron_run_emits_skipped_receipt_without_delivery(monkeypatch):
 
 
 def test_dashboard_create_forwards_companion_host_contract(tmp_path, monkeypatch):
-    import hermes_cli.web_server as web_server
+    import hermes_cli.web_server_cron as web_server
 
     captured = {}
     monkeypatch.setattr(
@@ -312,7 +312,7 @@ def test_dashboard_create_forwards_companion_host_contract(tmp_path, monkeypatch
 
 
 def test_run_exception_emits_failed_receipt(monkeypatch):
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     receipts = []
 

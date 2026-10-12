@@ -7,7 +7,7 @@ in a consumer plugin such as Soma.
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Any
 
 
@@ -23,7 +23,7 @@ def _emit(name: str, session_id: str, *, subject_id: str, origin: str, **payload
         session_id=session_id,
         subject_id=subject_id,
         origin=origin,
-        occurred_at=datetime.now(timezone.utc).isoformat(),
+        occurred_at=datetime.now(UTC).isoformat(),
         **payload,
     )
 

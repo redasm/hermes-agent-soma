@@ -78,10 +78,10 @@ model couldn't produce valid JSON, `result.parsed` is `None` and
 
 ## What this lane gives you
 
-* **One call, sync or async.** `complete()` for chat,
-  `complete_structured()` for typed JSON, and their async siblings.
-  `acomplete_chat()` additionally preserves native assistant tool calls
-  for plugin-owned dialogue loops.
+* **One call, four shapes.** `complete()` for chat,
+  `complete_structured()` for typed JSON, `acomplete()` and
+  `acomplete_structured()` for asyncio. Same arguments, same result
+  objects.
 * **Host-owned credentials.** OAuth tokens, refresh flows, the
   credential pool, per-task aux overrides — every credential
   concept Hermes already has applies. The plugin never sees a
@@ -217,13 +217,13 @@ result = ctx.llm.complete(
     messages=[{"role": "user", "content": "Hi"}],
     provider=None,         # optional, gated — Hermes provider id (e.g. "openrouter")
     model=None,            # optional, gated — whatever string that provider expects
-    model_config_key=None, # optional — read plugins.<plugin-id>.<key>
     temperature=None,
     max_tokens=None,
     timeout=None,          # seconds
     agent_id=None,         # optional, gated
     profile=None,          # optional, gated — explicit auth-profile name
     purpose="optional-audit-string",
+    task=None,             # optional — a plugin-registered auxiliary slot
 )
 # → PluginLlmCompleteResult(text, provider, model, agent_id, usage, audit)
 ```
@@ -238,29 +238,6 @@ as the host's main config (`model.provider` + `model.model`). Set
 just `model=` to use the user's active provider with a different
 model on it. Set both to switch providers entirely. Either argument
 without operator opt-in raises `PluginLlmTrustError`.
-
-If a plugin exposes a named model setting to the operator, it should pass the
-setting name instead of copying its value into `model=`:
-
-```yaml
-plugins:
-  my-plugin:
-    dialogue_model: openai/gpt-4o-mini
-```
-
-```python
-result = ctx.llm.complete(
-    messages=messages,
-    model_config_key="dialogue_model",
-)
-```
-
-Hermes resolves the value only from the calling plugin's own
-`plugins.<plugin-id>` section. Because the operator selected that value
-directly, no `allow_model_override` or `allowed_models` duplication is
-required. If the setting is absent or blank, the call inherits the host model.
-The plugin cannot combine `model=` and `model_config_key=`. Arbitrary direct
-`model=` selection remains fail-closed behind the trust gate below.
 
 ### `complete_structured()`
 
@@ -278,13 +255,13 @@ result = ctx.llm.complete_structured(
     system_prompt=None,
     provider=None,         # optional, gated
     model=None,            # optional, gated
-    model_config_key=None, # optional — read plugins.<plugin-id>.<key>
     temperature=None,
     max_tokens=None,
     timeout=None,
     agent_id=None,
     profile=None,
     purpose=None,
+    task=None,             # optional — a plugin-registered auxiliary slot
 )
 # → PluginLlmStructuredResult(text, provider, model, agent_id,
 #                             usage, parsed, content_type, audit)
@@ -304,16 +281,90 @@ against your schema if `jsonschema` is installed.
 ### Async
 
 ```python
-result = await ctx.llm.acomplete(messages=...)
-result = await ctx.llm.acomplete_chat(messages=..., tools=...)
-result = await ctx.llm.acomplete_structured(instructions=..., input=...)
+result = await ctx.llm.acomplete(messages=..., task="classifier")
+result = await ctx.llm.acomplete_structured(
+    instructions=..., input=..., task="classifier"
+)
 ```
 
-The ordinary async methods mirror their sync counterparts.
-`acomplete_chat()` preserves provider-normalized tool calls and native
-assistant/tool continuation messages for a bounded plugin-owned dialogue
-loop. Use these from gateway adapters, async hooks, or any plugin code already
-running on an asyncio loop.
+Same arguments and result types as their sync counterparts. Use
+these from gateway adapters, async hooks, or any plugin code
+already running on an asyncio loop.
+
+### Task-routed auxiliary calls
+
+Pass `task=` to any of the four call shapes when a plugin needs its
+own configured auxiliary route. Register that task during plugin setup;
+plugin defaults apply until the operator overrides its provider and model
+in `auxiliary.<task>`:
+
+```python
+def register(ctx):
+    ctx.register_auxiliary_task(
+        "classifier", display_name="Classifier", description="Classify input."
+    )
+
+
+result = ctx.llm.complete(messages=[...], task="classifier")
+result = ctx.llm.complete_structured(instructions=..., input=..., task="classifier")
+```
+
+```yaml
+auxiliary:
+  classifier:
+    provider: openrouter
+    model: vendor/model-id
+```
+
+Plugins may supply provider/model registration defaults for their own
+tasks. Operator configuration in `auxiliary.<task>` overrides those
+defaults and controls the deployment choice. A registered task is a
+first-class slot on every model-assignment surface: the `hermes model` →
+*Configure auxiliary models* picker, the dashboard Models page, and Desktop
+Settings → Models → Auxiliary all list it (after the built-in tasks, under
+the plugin's `display_name`) and can pin, reset, or flag it as a stale
+provider pin like any built-in. A plugin can only use a task
+it registered itself; unknown or foreign task names fail before provider
+invocation. `allow_task_override: true` is an explicit operator grant for
+using Hermes built-in auxiliary tasks; it does not permit another plugin's
+tasks. Omit `task=` (or use `"auto"`) to keep the active main provider/model.
+
+#### Inheriting a built-in slot
+
+`inherit_from` names a built-in auxiliary task (`compression`, `mcp`,
+`vision`, ...) or a task your plugin (or one loaded before it) already
+registered. Your task then uses that slot's model until the operator pins
+one on your task directly:
+
+```python
+def register(ctx):
+    ctx.register_auxiliary_task(
+        "classifier",
+        display_name="Classifier",
+        description="Classify input.",
+        inherit_from="compression",         # use whatever compression uses...
+        defaults={"timeout": 90},           # ...but give slow classifiers more room
+    )
+```
+
+- **Resolved on every read, not copied at registration.** Change
+  `auxiliary.compression` (CLI, dashboard, Desktop, or `config.yaml`) and the
+  classifier follows on its next call, per profile.
+- **Precedence:** the inherited base, then the plugin's `defaults`, then the
+  operator's `auxiliary.<task>` block.
+- **An operator pin wins as a whole route.** Once `auxiliary.classifier` sets a
+  non-`auto` provider, a model or a `base_url`, the provider, model, endpoint,
+  key and reasoning effort all come from that block; nothing from the base's
+  route is mixed in. `provider: auto` with an empty model is "no preference",
+  so the task keeps following its base (that is what "Reset all" and Desktop's
+  *Follow &lt;base&gt;* button write).
+- **A bad base never breaks the plugin.** An unknown or self-referential
+  `inherit_from` logs a warning and the task registers without inheritance.
+
+The Models settings show an unpinned inheriting task as
+*inherits Compression · &lt;provider · model&gt;*, and
+`GET /api/model/auxiliary` returns `inherit_from` plus an `effective`
+`{provider, model, base_url}` on such rows.
 
 ### Result attributes
 
@@ -328,7 +379,8 @@ class PluginLlmCompleteResult:
     audit: Dict[str, Any]        # plugin_id, purpose, profile
 
 @dataclass
-class PluginLlmStructuredResult(PluginLlmCompleteResult):
+class PluginLlmStructuredResult:
+    # same fields as PluginLlmCompleteResult, plus:
     parsed: Optional[Any]        # JSON object when content_type == "json"
     content_type: str            # "json" or "text"
     # audit also carries schema_name when supplied
@@ -351,9 +403,8 @@ config block, a plugin can:
 
 …and that's it. `provider=`, `model=`, `agent_id=`, and `profile=`
 arguments raise `PluginLlmTrustError` until the operator opts in.
-`model_config_key=` is different: it names an operator-owned scalar setting
-inside the calling plugin's own config section and cannot read another
-plugin's namespace.
+Likewise, `task=` can use only the plugin's registered auxiliary task
+unless the operator grants `allow_task_override` for a built-in task.
 
 **Most plugins never need this section.** A plugin that just calls
 `ctx.llm.complete(messages=...)` with no overrides runs against
@@ -406,9 +457,9 @@ path-derived key for nested plugins (`image_gen/openai`,
 | ↳ allowlist     | —       | `allowed_providers: [...]`       |
 | `model=`        | denied  | `allow_model_override: true`     |
 | ↳ allowlist     | —       | `allowed_models: [...]`          |
-| `model_config_key=` | own namespace only | no duplicate grant |
 | `agent_id=`     | denied  | `allow_agent_id_override: true`  |
 | `profile=`      | denied  | `allow_profile_override: true`   |
+| built-in `task=` | denied  | `allow_task_override: true`      |
 
 Each override is independently gated. Granting `allow_model_override`
 does **not** also grant `allow_provider_override` — a plugin trusted
@@ -423,9 +474,8 @@ it gets the provider gate as well.
   allowed; they don't pick credentials or routes.
 * The default deny posture means an unconfigured plugin can still do
   useful work — it just runs against the active provider and model.
-  Operators only need to think about `plugins.entries` for plugins that
-  directly select routing values. Operator-owned model settings under
-  `plugins.<plugin-id>` use `model_config_key=` instead.
+  Operators only need to think about `plugins.entries` for plugins
+  that want finer routing.
 
 ## What the host owns
 
@@ -495,4 +545,19 @@ own model call — for any reason, structured or not — `ctx.llm`.
   * [`plugin-llm-example`](https://github.com/NousResearch/hermes-example-plugins/tree/main/plugin-llm-example) — sync structured extraction with image input
   * [`plugin-llm-async-example`](https://github.com/NousResearch/hermes-example-plugins/tree/main/plugin-llm-async-example) — async with `asyncio.gather()`
 * Auxiliary client (the engine under the hood): see
-  [Provider Runtime](/developer-guide/provider-runtime).
+  [Provider Runtime](./provider-runtime.md).
+
+
+## Soma fork extensions
+
+`model_config_key="dialogue_model"` selects an operator-owned scalar setting under
+`plugins.<calling-plugin-id>.dialogue_model`. It cannot read another plugin's namespace
+or a dotted/dynamic key path, and cannot be combined with a direct `model=` override.
+Direct overrides retain the normal `plugins.entries.<id>.llm` trust checks.
+
+`complete_structured()` and `acomplete_structured()` also accept native `tools` and
+`tool_choice`. A tool-only response has `content_type="tool_calls"` and normalized
+`tool_calls` with `id`, `name`, and object-valued `arguments`.
+`acomplete_chat(messages=..., tools=..., tool_choice=...)` preserves native assistant/tool
+continuation messages for a bounded plugin-owned dialogue loop; each invocation still
+uses the host routing, credentials, timeouts, and auditing.

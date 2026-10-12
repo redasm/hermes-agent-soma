@@ -8,7 +8,7 @@ platforms: [macos, linux]
 metadata:
   hermes:
     tags: [Search, Knowledge-Base, RAG, Notes, MCP, Local-AI]
-    related_skills: [obsidian, native-mcp, arxiv]
+    related_skills: [obsidian, hermes-agent, arxiv]
 ---
 
 # QMD — Query Markup Documents
@@ -291,9 +291,9 @@ cat > ~/Library/LaunchAgents/com.qmd.daemon.plist << 'EOF'
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/tmp/qmd-daemon.log</string>
+  <string>/Users/YOU/.hermes/cache/scratch/qmd-daemon.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/qmd-daemon.log</string>
+  <string>/Users/YOU/.hermes/cache/scratch/qmd-daemon.log</string>
 </dict>
 </plist>
 EOF

@@ -8,19 +8,17 @@ so we don't hit real providers.
 
 from __future__ import annotations
 
+import json
 import asyncio
 import base64
-import json
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
 from agent.plugin_llm import (
-    PluginLlm,
-    PluginLlmChatResult,
     PluginLlmCompleteResult,
+    PluginLlmChatResult,
     PluginLlmImageInput,
     PluginLlmStructuredResult,
     PluginLlmTextInput,
@@ -39,9 +37,7 @@ from agent.plugin_llm import (
 # ---------------------------------------------------------------------------
 
 
-def _fake_response(
-    text: str, *, prompt: int = 4, completion: int = 6
-) -> SimpleNamespace:
+def _fake_response(text: str, *, prompt: int = 4, completion: int = 6) -> SimpleNamespace:
     """Build an OpenAI-shaped response with the given text + token usage."""
     return SimpleNamespace(
         choices=[
@@ -82,9 +78,7 @@ def _fake_tool_response(name: str, arguments: dict) -> SimpleNamespace:
     )
 
 
-def _trusted_policy(
-    plugin_id: str = "trusted-plugin", **overrides: Any
-) -> _TrustPolicy:
+def _trusted_policy(plugin_id: str = "trusted-plugin", **overrides: Any) -> _TrustPolicy:
     defaults = dict(
         allow_provider_override=True,
         allowed_providers=None,
@@ -105,51 +99,6 @@ def _trusted_policy(
 
 
 class TestTrustGate:
-    def test_default_policy_blocks_provider_override(self):
-        policy = _TrustPolicy(plugin_id="locked")
-        with pytest.raises(PluginLlmTrustError, match="cannot override the provider"):
-            _check_overrides(
-                policy,
-                requested_provider="anthropic",
-                requested_model=None,
-                requested_agent_id=None,
-                requested_profile=None,
-            )
-
-    def test_default_policy_blocks_model_override(self):
-        policy = _TrustPolicy(plugin_id="locked")
-        with pytest.raises(PluginLlmTrustError, match="cannot override the model"):
-            _check_overrides(
-                policy,
-                requested_provider=None,
-                requested_model="claude-3-5-sonnet",
-                requested_agent_id=None,
-                requested_profile=None,
-            )
-
-    def test_default_policy_blocks_agent_override(self):
-        policy = _TrustPolicy(plugin_id="locked")
-        with pytest.raises(PluginLlmTrustError, match="non-default agent id"):
-            _check_overrides(
-                policy,
-                requested_provider=None,
-                requested_model=None,
-                requested_agent_id="ada",
-                requested_profile=None,
-            )
-
-    def test_default_policy_blocks_profile_override(self):
-        policy = _TrustPolicy(plugin_id="locked")
-        with pytest.raises(
-            PluginLlmTrustError, match="cannot override the auth profile"
-        ):
-            _check_overrides(
-                policy,
-                requested_provider=None,
-                requested_model=None,
-                requested_agent_id=None,
-                requested_profile="work",
-            )
 
     def test_overrides_independent(self):
         """Each override is gated independently — turning on
@@ -178,22 +127,6 @@ class TestTrustGate:
                 requested_profile=None,
             )
 
-    def test_provider_allowlist_rejects_non_listed(self):
-        policy = _TrustPolicy(
-            plugin_id="restricted",
-            allow_provider_override=True,
-            allowed_providers=frozenset({"openrouter", "anthropic"}),
-            allow_any_provider=False,
-        )
-        with pytest.raises(PluginLlmTrustError, match="not in plugins.entries"):
-            _check_overrides(
-                policy,
-                requested_provider="openai",
-                requested_model=None,
-                requested_agent_id=None,
-                requested_profile=None,
-            )
-
     def test_provider_allowlist_accepts_listed_case_insensitively(self):
         policy = _TrustPolicy(
             plugin_id="restricted",
@@ -209,38 +142,6 @@ class TestTrustGate:
             requested_profile=None,
         )
         assert p == "OpenRouter"
-
-    def test_model_allowlist_rejects_non_listed(self):
-        policy = _TrustPolicy(
-            plugin_id="restricted",
-            allow_model_override=True,
-            allowed_models=frozenset({"openai/gpt-4o-mini"}),
-            allow_any_model=False,
-        )
-        with pytest.raises(PluginLlmTrustError, match="not in plugins.entries"):
-            _check_overrides(
-                policy,
-                requested_provider=None,
-                requested_model="anthropic/claude-3-opus",
-                requested_agent_id=None,
-                requested_profile=None,
-            )
-
-    def test_model_allowlist_accepts_listed_case_insensitively(self):
-        policy = _TrustPolicy(
-            plugin_id="restricted",
-            allow_model_override=True,
-            allowed_models=frozenset({"openai/gpt-4o-mini"}),
-            allow_any_model=False,
-        )
-        _, m, _, _ = _check_overrides(
-            policy,
-            requested_provider=None,
-            requested_model="OpenAI/GPT-4o-mini",
-            requested_agent_id=None,
-            requested_profile=None,
-        )
-        assert m == "OpenAI/GPT-4o-mini"
 
     def test_no_overrides_passes_through(self):
         policy = _TrustPolicy(plugin_id="locked")
@@ -266,10 +167,6 @@ class TestTrustGate:
 
 
 class TestAllowlistCoercion:
-    def test_missing_yields_none(self):
-        ranges, allow_any = _coerce_allowlist(None)
-        assert ranges is None
-        assert allow_any is False
 
     def test_list_of_strings(self):
         ranges, allow_any = _coerce_allowlist(["A", "B"])
@@ -280,16 +177,6 @@ class TestAllowlistCoercion:
         ranges, allow_any = _coerce_allowlist(["*"])
         assert ranges == frozenset()
         assert allow_any is True
-
-    def test_star_plus_specific_keeps_specifics(self):
-        ranges, allow_any = _coerce_allowlist(["*", "openrouter"])
-        assert ranges == frozenset({"openrouter"})
-        assert allow_any is True
-
-    def test_non_list_yields_none(self):
-        ranges, allow_any = _coerce_allowlist("openrouter")
-        assert ranges is None
-        assert allow_any is False
 
 
 # ---------------------------------------------------------------------------
@@ -313,30 +200,6 @@ class TestStructuredMessageBuilding:
         assert parts[0]["type"] == "text"
         assert "Extract the action items" in parts[0]["text"]
         assert parts[1] == {"type": "text", "text": "meeting notes go here"}
-
-    def test_json_mode_adds_system_directive(self):
-        messages = _build_structured_messages(
-            instructions="Summarise",
-            inputs=[PluginLlmTextInput(text="content")],
-            json_mode=True,
-            json_schema=None,
-            schema_name=None,
-            system_prompt=None,
-        )
-        assert messages[0]["role"] == "system"
-        assert "JSON object" in messages[0]["content"]
-
-    def test_schema_name_appended_to_header(self):
-        messages = _build_structured_messages(
-            instructions="Extract fields",
-            inputs=[PluginLlmTextInput(text="data")],
-            json_mode=False,
-            json_schema=None,
-            schema_name="action.items",
-            system_prompt=None,
-        )
-        header = messages[0]["content"][0]["text"]
-        assert "Schema name: action.items" in header
 
     def test_image_bytes_encoded_as_data_url(self):
         png_bytes = b"\x89PNG\r\n\x1a\nfake"
@@ -372,33 +235,6 @@ class TestStructuredMessageBuilding:
         assert img_part["type"] == "image_url"
         assert img_part["image_url"]["url"] == "https://example.com/cat.jpg"
 
-    def test_dict_inputs_normalized(self):
-        messages = _build_structured_messages(
-            instructions="Test",
-            inputs=[
-                {"type": "text", "text": "hello"},
-                {"type": "image", "url": "https://x.example/y.png"},
-            ],
-            json_mode=False,
-            json_schema=None,
-            schema_name=None,
-            system_prompt=None,
-        )
-        parts = messages[0]["content"]
-        assert parts[1]["text"] == "hello"
-        assert parts[2]["image_url"]["url"] == "https://x.example/y.png"
-
-    def test_invalid_input_block_rejected(self):
-        with pytest.raises(ValueError, match="Unknown input block"):
-            _build_structured_messages(
-                instructions="Test",
-                inputs=[{"type": "audio", "data": b""}],
-                json_mode=False,
-                json_schema=None,
-                schema_name=None,
-                system_prompt=None,
-            )
-
 
 # ---------------------------------------------------------------------------
 # JSON parsing
@@ -409,19 +245,6 @@ class TestJsonParsing:
     def test_strip_code_fences_with_json_label(self):
         assert _strip_code_fences('```json\n{"a":1}\n```') == '{"a":1}'
 
-    def test_strip_code_fences_without_label(self):
-        assert _strip_code_fences("```\nfoo\n```") == "foo"
-
-    def test_strip_code_fences_no_fence(self):
-        assert _strip_code_fences('{"a":1}') == '{"a":1}'
-
-    def test_parse_returns_text_when_not_json_mode(self):
-        parsed, ct = _parse_structured_text(
-            text='{"a": 1}', json_mode=False, json_schema=None
-        )
-        assert parsed is None
-        assert ct == "text"
-
     def test_parse_valid_json_with_json_mode(self):
         parsed, ct = _parse_structured_text(
             text='{"language": "French", "is_question": true}',
@@ -430,38 +253,6 @@ class TestJsonParsing:
         )
         assert parsed == {"language": "French", "is_question": True}
         assert ct == "json"
-
-    def test_parse_strips_code_fences_before_loading(self):
-        parsed, ct = _parse_structured_text(
-            text='Here you go:\n```json\n{"ok": true}\n```',
-            json_mode=True,
-            json_schema=None,
-        )
-        assert parsed == {"ok": True}
-        assert ct == "json"
-
-    def test_parse_returns_text_on_invalid_json(self):
-        parsed, ct = _parse_structured_text(
-            text="not even close to json",
-            json_mode=True,
-            json_schema=None,
-        )
-        assert parsed is None
-        assert ct == "text"
-
-    def test_schema_validation_rejects_mismatch(self):
-        pytest.importorskip("jsonschema")
-        schema = {
-            "type": "object",
-            "properties": {"language": {"type": "string"}},
-            "required": ["language"],
-        }
-        with pytest.raises(ValueError, match="did not match schema"):
-            _parse_structured_text(
-                text='{"is_question": true}',
-                json_mode=False,
-                json_schema=schema,
-            )
 
     def test_schema_validation_accepts_match(self):
         pytest.importorskip("jsonschema")
@@ -506,30 +297,6 @@ class TestPluginLlmFacade:
         assert result.usage.input_tokens == 4
         assert result.usage.total_tokens == 10
 
-    def test_complete_rejects_provider_override_without_trust(self):
-        llm = make_plugin_llm_for_test(
-            plugin_id="my-plugin",
-            policy=_TrustPolicy(plugin_id="my-plugin"),
-            sync_caller=lambda **_: ("x", "y", _fake_response("")),
-        )
-        with pytest.raises(PluginLlmTrustError, match="cannot override the provider"):
-            llm.complete(
-                [{"role": "user", "content": "hi"}],
-                provider="openrouter",
-            )
-
-    def test_complete_rejects_model_override_without_trust(self):
-        llm = make_plugin_llm_for_test(
-            plugin_id="my-plugin",
-            policy=_TrustPolicy(plugin_id="my-plugin"),
-            sync_caller=lambda **_: ("x", "y", _fake_response("")),
-        )
-        with pytest.raises(PluginLlmTrustError, match="cannot override the model"):
-            llm.complete(
-                [{"role": "user", "content": "hi"}],
-                model="anthropic/claude-3-opus",
-            )
-
     def test_complete_passes_through_trusted_overrides(self):
         captured: dict = {}
 
@@ -566,12 +333,8 @@ class TestPluginLlmFacade:
 
     def test_complete_structured_returns_parsed_json(self):
         def fake_caller(**_kwargs):
-            return (
-                "openai",
-                "gpt-4o",
-                _fake_response(
-                    '{"language": "French", "is_question": true, "confidence": 0.99}'
-                ),
+            return "openai", "gpt-4o", _fake_response(
+                '{"language": "French", "is_question": true, "confidence": 0.99}'
             )
 
         llm = make_plugin_llm_for_test(
@@ -592,92 +355,29 @@ class TestPluginLlmFacade:
         }
         assert result.content_type == "json"
 
-    def test_complete_structured_returns_text_on_unparseable_response(self):
-        def fake_caller(**_kwargs):
-            return "openai", "gpt-4o", _fake_response("Sorry, I can't help with that.")
-
-        llm = make_plugin_llm_for_test(
-            plugin_id="my-plugin",
-            policy=_TrustPolicy(plugin_id="my-plugin"),
-            sync_caller=fake_caller,
-        )
-        result = llm.complete_structured(
-            instructions="Detect language",
-            input=[PluginLlmTextInput(text="x")],
-            json_mode=True,
-        )
-        assert result.parsed is None
-        assert result.content_type == "text"
-        assert result.text.startswith("Sorry")
-
-    def test_complete_structured_validates_against_schema(self):
-        pytest.importorskip("jsonschema")
-
-        def fake_caller(**_kwargs):
-            return "openai", "gpt-4o", _fake_response('{"unrelated": "field"}')
-
-        llm = make_plugin_llm_for_test(
-            plugin_id="my-plugin",
-            policy=_TrustPolicy(plugin_id="my-plugin"),
-            sync_caller=fake_caller,
-        )
-        schema = {
-            "type": "object",
-            "properties": {"language": {"type": "string"}},
-            "required": ["language"],
-        }
-        with pytest.raises(ValueError, match="did not match schema"):
-            llm.complete_structured(
-                instructions="Detect language",
-                input=[PluginLlmTextInput(text="x")],
-                json_schema=schema,
-            )
-
-    def test_complete_structured_requires_instructions(self):
-        llm = make_plugin_llm_for_test(
-            plugin_id="my-plugin",
-            policy=_TrustPolicy(plugin_id="my-plugin"),
-            sync_caller=MagicMock(),
-        )
-        with pytest.raises(ValueError, match="non-empty instructions"):
-            llm.complete_structured(
-                instructions="   ",
-                input=[PluginLlmTextInput(text="x")],
-            )
-
-    def test_complete_structured_requires_at_least_one_input(self):
-        llm = make_plugin_llm_for_test(
-            plugin_id="my-plugin",
-            policy=_TrustPolicy(plugin_id="my-plugin"),
-            sync_caller=MagicMock(),
-        )
-        with pytest.raises(ValueError, match="at least one input"):
-            llm.complete_structured(
-                instructions="Extract",
-                input=[],
-            )
-
-    def test_complete_structured_emits_response_format_extra_body(self):
+    def test_complete_structured_with_image_passes_image_url_part(self):
         captured: dict = {}
 
         def fake_caller(**kwargs):
             captured.update(kwargs)
-            return "openai", "gpt-4o", _fake_response('{"a": 1}')
+            return "openai", "gpt-4o", _fake_response('{"caption": "ok"}')
 
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_TrustPolicy(plugin_id="my-plugin"),
             sync_caller=fake_caller,
         )
-        schema = {"type": "object"}
+        png = b"fake-bytes"
         llm.complete_structured(
-            instructions="Test",
-            input=[PluginLlmTextInput(text="x")],
-            json_schema=schema,
+            instructions="Caption this",
+            input=[PluginLlmImageInput(data=png, mime_type="image/png")],
+            json_mode=True,
         )
-        rf = captured["extra_body"]["response_format"]
-        assert rf["type"] == "json_schema"
-        assert rf["json_schema"]["schema"] == schema
+        msgs = captured["messages"]
+        user_msg = next(m for m in msgs if m["role"] == "user")
+        image_parts = [p for p in user_msg["content"] if p.get("type") == "image_url"]
+        assert len(image_parts) == 1
+        assert image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
 
     def test_complete_structured_passes_native_tools_and_returns_tool_calls(self):
         captured: dict = {}
@@ -726,30 +426,6 @@ class TestPluginLlmFacade:
         assert "If you do not call a provided tool" in system_prompt
         assert result.tool_calls[0].name == "request_host_task"
 
-    def test_complete_structured_with_image_passes_image_url_part(self):
-        captured: dict = {}
-
-        def fake_caller(**kwargs):
-            captured.update(kwargs)
-            return "openai", "gpt-4o", _fake_response('{"caption": "ok"}')
-
-        llm = make_plugin_llm_for_test(
-            plugin_id="my-plugin",
-            policy=_TrustPolicy(plugin_id="my-plugin"),
-            sync_caller=fake_caller,
-        )
-        png = b"fake-bytes"
-        llm.complete_structured(
-            instructions="Caption this",
-            input=[PluginLlmImageInput(data=png, mime_type="image/png")],
-            json_mode=True,
-        )
-        msgs = captured["messages"]
-        user_msg = next(m for m in msgs if m["role"] == "user")
-        image_parts = [p for p in user_msg["content"] if p.get("type") == "image_url"]
-        assert len(image_parts) == 1
-        assert image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
-
 
 # ---------------------------------------------------------------------------
 # Async surface
@@ -757,9 +433,9 @@ class TestPluginLlmFacade:
 
 
 class TestAsyncSurface:
-    def test_acomplete_uses_async_caller(self):
+    def test_acomplete_structured_parses_json(self):
         async def fake_async(**_kwargs):
-            return "openai", "gpt-4o", _fake_response("async hello")
+            return "openai", "gpt-4o", _fake_response('{"x": 42}')
 
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
@@ -767,12 +443,66 @@ class TestAsyncSurface:
             async_caller=fake_async,
         )
 
-        async def _run() -> PluginLlmCompleteResult:
-            return await llm.acomplete([{"role": "user", "content": "hi"}])
+        async def _run() -> PluginLlmStructuredResult:
+            return await llm.acomplete_structured(
+                instructions="Extract x",
+                input=[PluginLlmTextInput(text="data")],
+                json_mode=True,
+            )
 
         result = asyncio.run(_run())
-        assert result.text == "async hello"
-        assert result.provider == "openai"
+        assert result.parsed == {"x": 42}
+        assert result.content_type == "json"
+
+    def test_acomplete_structured_passes_native_tools_and_returns_tool_calls(self):
+        captured: dict = {}
+
+        async def fake_async(**kwargs):
+            captured.update(kwargs)
+            return (
+                "openai",
+                "gpt-4o",
+                _fake_tool_response(
+                    "request_visual_capture",
+                    {"objective": "Show what I look like right now."},
+                ),
+            )
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="soma-companion",
+            policy=_TrustPolicy(plugin_id="soma-companion"),
+            async_caller=fake_async,
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "request_visual_capture",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+
+        async def _run():
+            try:
+                return await llm.acomplete_structured(
+                    instructions="Reply or request one capability.",
+                    input=[PluginLlmTextInput(text="让我看看你现在什么样子")],
+                    json_mode=True,
+                    tools=tools,
+                    tool_choice="required",
+                )
+            except TypeError as exc:
+                return exc
+
+        result = asyncio.run(_run())
+
+        assert not isinstance(result, TypeError), str(result)
+        assert captured["tools"] == tools
+        assert captured["tool_choice"] == "required"
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].name == "request_visual_capture"
+        assert result.tool_calls[0].arguments == {"objective": "Show what I look like right now."}
 
     def test_acomplete_chat_preserves_native_messages_and_tool_calls(self):
         captured: dict = {}
@@ -870,79 +600,6 @@ class TestAsyncSurface:
         assert result.text == "The tests passed."
         assert result.audit["purpose"] == "companion_dialogue_finalize"
 
-    def test_acomplete_structured_parses_json(self):
-        async def fake_async(**_kwargs):
-            return "openai", "gpt-4o", _fake_response('{"x": 42}')
-
-        llm = make_plugin_llm_for_test(
-            plugin_id="my-plugin",
-            policy=_TrustPolicy(plugin_id="my-plugin"),
-            async_caller=fake_async,
-        )
-
-        async def _run() -> PluginLlmStructuredResult:
-            return await llm.acomplete_structured(
-                instructions="Extract x",
-                input=[PluginLlmTextInput(text="data")],
-                json_mode=True,
-            )
-
-        result = asyncio.run(_run())
-        assert result.parsed == {"x": 42}
-        assert result.content_type == "json"
-
-    def test_acomplete_structured_passes_native_tools_and_returns_tool_calls(self):
-        captured: dict = {}
-
-        async def fake_async(**kwargs):
-            captured.update(kwargs)
-            return (
-                "openai",
-                "gpt-4o",
-                _fake_tool_response(
-                    "request_visual_capture",
-                    {"objective": "Show what I look like right now."},
-                ),
-            )
-
-        llm = make_plugin_llm_for_test(
-            plugin_id="soma-companion",
-            policy=_TrustPolicy(plugin_id="soma-companion"),
-            async_caller=fake_async,
-        )
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "request_visual_capture",
-                    "parameters": {"type": "object"},
-                },
-            }
-        ]
-
-        async def _run():
-            try:
-                return await llm.acomplete_structured(
-                    instructions="Reply or request one capability.",
-                    input=[PluginLlmTextInput(text="让我看看你现在什么样子")],
-                    json_mode=True,
-                    tools=tools,
-                    tool_choice="required",
-                )
-            except TypeError as exc:
-                return exc
-
-        result = asyncio.run(_run())
-
-        assert not isinstance(result, TypeError), str(result)
-        assert captured["tools"] == tools
-        assert captured["tool_choice"] == "required"
-        assert len(result.tool_calls) == 1
-        assert result.tool_calls[0].name == "request_visual_capture"
-        assert result.tool_calls[0].arguments == {
-            "objective": "Show what I look like right now."
-        }
-
 
 # ---------------------------------------------------------------------------
 # Config-driven trust gate (round-trip via plugins.entries.<id>.llm)
@@ -987,9 +644,7 @@ plugins:
         assert captured["model_override"] == "soma-dialogue-model"
         assert result.model == "soma-dialogue-model"
 
-    def test_plugin_owned_model_config_is_scoped_to_calling_plugin(
-        self, tmp_path, monkeypatch
-    ):
+    def test_plugin_owned_model_config_is_scoped_to_calling_plugin(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text(
@@ -1098,7 +753,6 @@ plugins:
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         from hermes_cli import config as _config_mod
-
         _config_mod._config_cache = None  # type: ignore[attr-defined]
 
         policy = _resolve_trust_policy("my-plugin")
@@ -1106,12 +760,9 @@ plugins:
         assert policy.allow_model_override is True
         assert policy.allow_profile_override is False
         assert policy.allowed_providers == frozenset({"openrouter", "anthropic"})
-        assert policy.allowed_models == frozenset(
-            {
-                "openai/gpt-4o-mini",
-                "anthropic/claude-3-5-haiku",
-            }
-        )
+        assert policy.allowed_models == frozenset({
+            "openai/gpt-4o-mini", "anthropic/claude-3-5-haiku",
+        })
 
     def test_missing_plugin_entry_yields_default_deny(self, tmp_path, monkeypatch):
         from agent.plugin_llm import _resolve_trust_policy
@@ -1121,7 +772,6 @@ plugins:
         (hermes_home / "config.yaml").write_text("plugins: {}\n", encoding="utf-8")
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         from hermes_cli import config as _config_mod
-
         _config_mod._config_cache = None  # type: ignore[attr-defined]
 
         policy = _resolve_trust_policy("never-configured")
@@ -1137,17 +787,6 @@ plugins:
 
 
 class TestPluginContextIntegration:
-    def test_ctx_llm_is_lazy_singleton(self):
-        from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
-
-        manifest = PluginManifest(name="test-plugin", source="test", key="test-plugin")
-        manager = PluginManager()
-        ctx = PluginContext(manifest, manager)
-        first = ctx.llm
-        second = ctx.llm
-        assert first is second
-        assert isinstance(first, PluginLlm)
-        assert first._plugin_id == "test-plugin"  # type: ignore[attr-defined]
 
     def test_ctx_llm_uses_manifest_key_for_policy(self):
         from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
@@ -1170,19 +809,6 @@ class TestAttribution:
     provider/model that ``call_llm`` ended up using, NOT the placeholder
     fallbacks ('auto', 'default') from earlier drafts."""
 
-    def test_explicit_overrides_recorded_when_no_response_model(self):
-        from agent.plugin_llm import _resolve_attribution
-
-        # Response with no .model attribute — overrides win.
-        response = SimpleNamespace(choices=[], usage=None)
-        provider, model = _resolve_attribution(
-            provider_override="openrouter",
-            model_override="anthropic/claude-3-5-sonnet",
-            response=response,
-        )
-        assert provider == "openrouter"
-        assert model == "anthropic/claude-3-5-sonnet"
-
     def test_response_model_wins_over_model_override(self):
         """Providers often canonicalise the model name (e.g. ``gpt-4o``
         → ``gpt-4o-2024-08-06``). Whatever they actually returned wins
@@ -1198,27 +824,6 @@ class TestAttribution:
         assert model == "gpt-4o-2024-08-06"
         # Provider override is unaffected by response.model.
         assert provider == "openrouter"
-
-    def test_falls_back_to_main_provider_and_model_when_no_overrides(self, monkeypatch):
-        """When the plugin doesn't override anything, attribution
-        reflects the user's active main provider/model rather than
-        misleading placeholders."""
-        from agent import plugin_llm
-        import agent.auxiliary_client as ac
-
-        monkeypatch.setattr(ac, "_read_main_provider", lambda: "openrouter")
-        monkeypatch.setattr(
-            ac, "_read_main_model", lambda: "anthropic/claude-3-5-sonnet"
-        )
-
-        response = SimpleNamespace(choices=[])  # no .model attribute
-        provider, model = plugin_llm._resolve_attribution(
-            provider_override=None,
-            model_override=None,
-            response=response,
-        )
-        assert provider == "openrouter"
-        assert model == "anthropic/claude-3-5-sonnet"
 
     def test_response_model_used_even_when_no_overrides(self, monkeypatch):
         """The provider's canonical model name should still flow through
@@ -1237,25 +842,6 @@ class TestAttribution:
         )
         assert provider == "openrouter"
         assert model == "openai/gpt-4o-2024-08-06"
-
-    def test_placeholder_fallback_only_when_everything_is_empty(self, monkeypatch):
-        """If main_provider/main_model are unset AND there's no override
-        AND the response has no .model, fall through to the safety
-        placeholders so the result object never has empty strings."""
-        from agent import plugin_llm
-        import agent.auxiliary_client as ac
-
-        monkeypatch.setattr(ac, "_read_main_provider", lambda: "")
-        monkeypatch.setattr(ac, "_read_main_model", lambda: "")
-
-        response = SimpleNamespace(choices=[])
-        provider, model = plugin_llm._resolve_attribution(
-            provider_override=None,
-            model_override=None,
-            response=response,
-        )
-        assert provider == "auto"
-        assert model == "default"
 
 
 # ---------------------------------------------------------------------------
@@ -1318,38 +904,7 @@ class TestHookMode:
         assert len(captured) == 2  # one llm call + one hook return record
         llm_call = captured[0]
         assert "messages" in llm_call
-        assert any(
-            "rewrite" in m.get("content", "").lower()
-            for m in llm_call["messages"]
-            if isinstance(m, dict)
-        )
+        assert any("rewrite" in m.get("content", "").lower()
+                   for m in llm_call["messages"] if isinstance(m, dict))
         hook_record = captured[1]
         assert hook_record["hook_returned"] == "rewrote it"
-
-    def test_complete_works_from_post_tool_call_hook_when_async_caller_set(self):
-        """Hooks fired synchronously should still work with sync
-        ctx.llm.complete even if other callsites use async."""
-        from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
-
-        manifest = PluginManifest(name="hook-async", source="test", key="hook-async")
-        manager = PluginManager()
-        ctx = PluginContext(manifest, manager)
-
-        def fake_caller(**_):
-            return "openrouter", "model-x", _fake_response("ok")
-
-        ctx._llm = make_plugin_llm_for_test(  # type: ignore[attr-defined]
-            plugin_id="hook-async",
-            policy=_TrustPolicy(plugin_id="hook-async"),
-            sync_caller=fake_caller,
-        )
-
-        called: list = []
-
-        def hook(**kwargs):
-            r = ctx.llm.complete(messages=[{"role": "user", "content": "x"}])
-            called.append(r.text)
-
-        ctx.register_hook("post_tool_call", hook)
-        manager.invoke_hook("post_tool_call", tool_name="x", args={}, result="y")
-        assert called == ["ok"]

@@ -551,7 +551,7 @@ async def test_plugin_conversation_delivery_metadata_waits_for_success_receipt(
             return None
 
     adapter = Adapter()
-    runner._adapter_for_source = lambda _source: adapter
+    runner._delivery_adapter_for = lambda _source: adapter
     delivered = []
     manager = PluginManager()
     context = PluginContext(PluginManifest(name="dialogue-test"), manager)
