@@ -46,9 +46,19 @@ Windows regression invokes the real installer repository-staging functions
 against local Git repositories. Shared TypeScript checking and desktop bootstrap
 unit tests also pass.
 
-`python scripts/check --base 41cd7b649d` checks the Soma migration against the
-upstream integration parent. Release-only changes after that parent receive the
-release artifact/channel/sequencer/progress regressions.
+Both `python scripts/check --base 41cd7b649d` and the final
+`python scripts/check --base 590af66a58` pass all 12 checks, with zero blocking
+or advisory code-health findings. The final gateway/voice/scheduler/plugin batch
+passes 357 tests with four platform/dependency skips; the final small rerun
+passes 128 tests. The Responses/voice-reset boundary batch passes 96 tests.
+The release artifact/channel/sequencer/progress/stable suites pass all 98 tests,
+and the native Windows installer staging regression passes. These batches
+partly overlap; their counts must not be added as unique coverage.
+
+All 8,460 Python files present during final syntax verification compile.
+Shared TypeScript checking passes; desktop bootstrap tests pass 13 cases with
+one skipped. The test snapshots use the repository's actual files in an isolated
+WSL tree; native installer behavior is checked on Windows.
 
 The entire upstream test suite and complete desktop/website builds are not run.
 Live provider, messaging platform and device permission integrations require
