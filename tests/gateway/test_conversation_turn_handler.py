@@ -369,6 +369,35 @@ async def test_visual_capture_executor_dispatches_image_generate_once(tmp_path):
     assert calls[0][2] == {"task_id": "capability:visual-42"}
     assert "Take and send one casual phone photo at home." in calls[0][1]["prompt"]
     assert "stable" in calls[0][1]["prompt"]
+    assert "reference_image_urls" not in calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_visual_capture_executor_passes_soma_reference_images(tmp_path):
+    from gateway.conversation_turn import execute_visual_capture
+
+    image = tmp_path / "generated-selfie.png"
+    image.write_bytes(b"image")
+    calls = []
+
+    def dispatch(name, args, **kwargs):
+        calls.append((name, args, kwargs))
+        return json.dumps({"success": True, "image": str(image)})
+
+    references = ["/home/u/.hermes/soma/visual_reference/face.jpg", "/tmp/place.jpg"]
+    await execute_visual_capture(
+        {
+            "request_id": "capability:visual-43",
+            "kind": "visual_capture",
+            "objective": "Take one selfie at the cafe.",
+            "visual_grounding": '{"reference_images":["image 1: her face","image 2: cafe"]}',
+            "reference_images": references,
+        },
+        dispatch_tool=dispatch,
+    )
+
+    assert calls[0][1]["reference_image_urls"] == references
+    assert "use each only for its stated role" in calls[0][1]["prompt"]
 
 
 @pytest.mark.asyncio

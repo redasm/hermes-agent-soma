@@ -224,20 +224,39 @@ async def execute_visual_capture(
 
     objective = str(capability_request.get("objective") or "").strip()
     grounding = str(capability_request.get("visual_grounding") or "").strip()
+    references = [
+        str(path).strip()
+        for path in capability_request.get("reference_images") or ()
+        if isinstance(path, str) and path.strip()
+    ][:4]
+    reference_clause = (
+        "Reference images are attached in the order the grounding's reference_images list "
+        "describes; use each only for its stated role (a face reference fixes identity only, "
+        "a place reference fixes the real location only). "
+        if references
+        else ""
+    )
     prompt = (
         "Create exactly one photorealistic casual phone photo for the following objective. "
         "Treat the private grounding as factual constraints on identity, appearance, and "
-        "situation. Keep the same person and appearance described there. The result should "
+        "situation, and follow its photo_direction and place_direction exactly. "
+        + reference_clause
+        + "Keep the same person and appearance described there. The result should "
         "look like a natural personal photo, not promotional artwork. Do not add captions, "
         "labels, watermarks, borders, UI, or text.\n\nObjective:\n"
         + objective
         + "\n\nPrivate visual grounding:\n"
         + grounding
     )
+    arguments: dict[str, Any] = {"prompt": prompt, "aspect_ratio": "portrait"}
+    if references:
+        # Soma sends these only so the face and real place stay fixed; never drop them to
+        # "succeed" with a different face.
+        arguments["reference_image_urls"] = references
     raw_result = await asyncio.to_thread(
         dispatch_tool,
         "image_generate",
-        {"prompt": prompt, "aspect_ratio": "portrait"},
+        arguments,
         task_id=str(capability_request["request_id"]),
     )
     try:
